@@ -28,14 +28,21 @@ void winwdf_unload_driver(struct winwdf_driver *driver) {
     winwdf_destroy_object(&driver->object);
 }
 
-NTSTATUS winwdf_add_device(struct winwdf_driver *driver, HANDLE reg_key, libusb_device_handle *usb_dev, struct winwdf_device **dev) {
+NTSTATUS winwdf_add_device(struct winwdf_driver *driver, HANDLE reg_key, int hidraw_fd, struct winwdf_device **dev) {
+    log_info("winwdf_add_device: ENTER (driver=%p, hidraw_fd=%d)", driver, hidraw_fd);
     if(dev) *dev = NULL;
 
-    if(!driver->cfg.EvtDriverDeviceAdd) return EXIT_SUCCESS;
+    if(!driver->cfg.EvtDriverDeviceAdd) {
+        log_info("winwdf_add_device: no EvtDriverDeviceAdd callback, returning");
+        return EXIT_SUCCESS;
+    }
 
     //Add device
-    struct wdf_device_init *dev_init = wdf_create_device_init(driver, reg_key, usb_dev, dev);
-    return driver->cfg.EvtDriverDeviceAdd(&driver->object, dev_init);
+    struct wdf_device_init *dev_init = wdf_create_device_init(driver, reg_key, hidraw_fd, dev);
+    log_info("winwdf_add_device: >>> calling EvtDriverDeviceAdd (cb=%p)", driver->cfg.EvtDriverDeviceAdd);
+    NTSTATUS status = driver->cfg.EvtDriverDeviceAdd(&driver->object, dev_init);
+    log_info("winwdf_add_device: <<< EvtDriverDeviceAdd returned 0x%x", status);
+    return status;
 }
 
 static void driver_destr(struct winwdf_driver *driver) {

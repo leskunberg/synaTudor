@@ -311,6 +311,16 @@ __winfnc NTSTATUS BCryptEncrypt(struct bcrypt_key *key, UCHAR *in, ULONG in_size
         return WINERR_SET_CODE;
     }
 
+    /* Log plaintext before encryption (TLS record plaintext) */
+    if(in && in_size > 0 && in_size <= 4096) {
+        char hexbuf[256];
+        int hlen = 0;
+        ULONG show = in_size < 64 ? in_size : 64;
+        for(ULONG i = 0; i < show; i++)
+            hlen += snprintf(hexbuf + hlen, sizeof(hexbuf) - hlen, "%02x ", in[i]);
+        log_info("BCryptEncrypt PLAINTEXT (%u bytes): %s%s", in_size, hexbuf, in_size > 64 ? "..." : "");
+    }
+
     size_t sz = out_size;
     NTSTATUS status = key->algo->encrypt(key->algo, key->key_data, &key->algo_wrap->obj, pad_info, iv, iv_size, in, in_size, out, &sz);
     if(status == STATUS_SUCCESS) *res_size = (ULONG) sz;
@@ -327,7 +337,18 @@ __winfnc NTSTATUS BCryptDecrypt(struct bcrypt_key *key, UCHAR *in, ULONG in_size
 
     size_t sz = out_size;
     NTSTATUS status = key->algo->decrypt(key->algo, key->key_data, &key->algo_wrap->obj, pad_info, iv, iv_size, in, in_size, out, &sz);
-    if(status == STATUS_SUCCESS) *res_size = (ULONG) sz;
+    if(status == STATUS_SUCCESS) {
+        *res_size = (ULONG) sz;
+        /* Log plaintext after decryption (TLS record plaintext) */
+        if(out && sz > 0 && sz <= 4096) {
+            char hexbuf[256];
+            int hlen = 0;
+            ULONG show = sz < 64 ? (ULONG)sz : 64;
+            for(ULONG i = 0; i < show; i++)
+                hlen += snprintf(hexbuf + hlen, sizeof(hexbuf) - hlen, "%02x ", out[i]);
+            log_info("BCryptDecrypt PLAINTEXT (%zu bytes): %s%s", sz, hexbuf, sz > 64 ? "..." : "");
+        }
+    }
     return status;
 }
 WINAPI(BCryptDecrypt)

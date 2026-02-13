@@ -17,6 +17,7 @@ void *resolve_windows_api(const char *name) {
 }
 
 int winstr_len(const char16_t *str) {
+    if(!str) return 0;
     int len = 0;
     for(const char16_t *p = str; *p; p++) len++;
     return len;

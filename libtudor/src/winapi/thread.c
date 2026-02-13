@@ -74,12 +74,15 @@ static void *thread_entry(void *arg) {
 
     //Call the thread start routine
     thread_wait_resume(thread);
+    log_debug("[THREAD %u] start_proc=%p starting", thread->thread_id, thread->start_proc);
     thread->start_proc(thread->start_param);
+    log_debug("[THREAD %u] start_proc=%p RETURNED", thread->thread_id, thread->start_proc);
 
     return (void*) 0;
 }
 
 __winfnc HANDLE CreateThread(void *security_attrs, SIZE_T stack_size, THREAD_START_ROUTINE *start_proc, void *param, DWORD flags, DWORD *id) {
+    log_debug("CreateThread called: start_proc=%p param=%p flags=0x%x", start_proc, param, flags);
     //Allocate thread
     struct win_thread *thread = (struct win_thread*) malloc(sizeof(struct win_thread));
     if(!thread) { winerr_set_errno(); return NULL; }
@@ -118,6 +121,7 @@ WINAPI(GetThreadId)
 
 __winfnc DWORD ResumeThread(HANDLE handle) {
     struct win_thread *thread = (struct win_thread*) handle->data;
+    log_debug("ResumeThread called (thread_id=%u, suspend_cntr=%d)", thread->thread_id, thread->suspend_cntr);
 
     //Decrement the suspend counter
     cant_fail_ret(pthread_mutex_lock(&thread->lock));
@@ -126,11 +130,21 @@ __winfnc DWORD ResumeThread(HANDLE handle) {
     cant_fail_ret(pthread_cond_signal(&thread->suspend_cond));
     cant_fail_ret(pthread_mutex_unlock(&thread->lock));
 
+    log_debug("ResumeThread returned (prev_suspend_cntr=%u)", suspend_ctr);
     return suspend_ctr;
 }
 WINAPI(ResumeThread)
 
 __winfnc void ExitThread(DWORD exit_code) {
+    log_debug("ExitThread called (exit_code=%u) [ret=%p]", exit_code, __builtin_return_address(0));
     pthread_exit((void*) (uintptr_t) exit_code);
 }
 WINAPI(ExitThread)
+
+__winfnc BOOL TerminateThread(HANDLE handle, DWORD exit_code) {
+    struct win_thread *thread = (struct win_thread*) handle->data;
+    log_warn("TerminateThread called (thread_id=%u, exit_code=0x%x)", thread->thread_id, exit_code);
+    pthread_cancel(thread->thread);
+    return TRUE;
+}
+WINAPI(TerminateThread)

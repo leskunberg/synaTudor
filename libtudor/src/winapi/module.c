@@ -5,10 +5,10 @@ static pthread_rwlock_t modules_lock = PTHREAD_RWLOCK_INITIALIZER;
 static struct winmodule *modules_head;
 
 static void module_destr(struct winmodule *module) {
+    module->handle = NULL;
     if(module->cmdline) return;
 
     //Free the module
-    module->handle = NULL;
     winmodule_unregister(module);
     free((void*) module->name);
     free(module);
@@ -22,6 +22,24 @@ struct winmodule *winmodule_find(const char *name) {
         if(strcmp(m->name, name) == 0) {
             module = m;
             break;
+        }
+    }
+
+    cant_fail_ret(pthread_rwlock_unlock(&modules_lock));
+    return module;
+}
+
+struct winmodule *winmodule_find_by_addr(const void *addr) {
+    cant_fail_ret(pthread_rwlock_rdlock(&modules_lock));
+
+    struct winmodule *module = NULL;
+    for(struct winmodule *m = modules_head; m != NULL; m = m->next) {
+        if(m->image_base && m->image_size > 0) {
+            uintptr_t base = (uintptr_t)m->image_base;
+            if((uintptr_t)addr >= base && (uintptr_t)addr < base + m->image_size) {
+                module = m;
+                break;
+            }
         }
     }
 
@@ -87,12 +105,20 @@ __winfnc BOOL FreeLibrary(HANDLE handle) {
 WINAPI(FreeLibrary)
 
 __winfnc HANDLE GetModuleHandleA(const char *name) {
+    if(!name) {
+        struct winmodule *module = winmodule_get_cur();
+        return module ? module->handle : NULL;
+    }
     struct winmodule *module = (struct winmodule*) winmodule_find(name);
     return module ? module->handle : NULL;
 }
 WINAPI(GetModuleHandleA)
 
 __winfnc HANDLE GetModuleHandleW(const char16_t *name) {
+    if(!name) {
+        struct winmodule *module = winmodule_get_cur();
+        return module ? module->handle : NULL;
+    }
     char *cname = winstr_to_str(name);
     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
     free(cname);
@@ -101,9 +127,20 @@ __winfnc HANDLE GetModuleHandleW(const char16_t *name) {
 WINAPI(GetModuleHandleW)
 
 #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 0x00000004
+#define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 0x00000002
+
+struct winmodule *winmodule_find_by_addr(const void *addr);
+
 __winfnc BOOL GetModuleHandleExW(DWORD flags, const char16_t *name, HANDLE *out) {
     if(flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
-        log_warn("GetModuleHandleExW called with unsupported flag GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS! [addr=%p]", name);
+        struct winmodule *module = winmodule_find_by_addr((const void *)name);
+        if(module) {
+            log_debug("GetModuleHandleExW: resolved addr %p to module '%s'", name, module->name);
+            if(out) *out = module->handle;
+            return TRUE;
+        }
+        log_warn("GetModuleHandleExW: couldn't resolve addr %p to any module", name);
+        if(out) *out = NULL;
         return FALSE;
     }
 
@@ -111,7 +148,7 @@ __winfnc BOOL GetModuleHandleExW(DWORD flags, const char16_t *name, HANDLE *out)
     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
     free(cname);
 
-    if(module) *out = module->handle;
+    if(module && out) *out = module->handle;
     return module != NULL;
 }
 WINAPI(GetModuleHandleExW)
@@ -166,6 +203,23 @@ __winfnc BOOL DisableThreadLibraryCalls(HANDLE handle) {
     return TRUE;
 }
 WINAPI(DisableThreadLibraryCalls)
+
+__winfnc HANDLE LoadLibraryA(const char *name) {
+    struct winmodule *module = (struct winmodule*) malloc(sizeof(struct winmodule));
+    if(!module) { winerr_set_errno(); return NULL; }
+    *module = (struct winmodule) {0};
+    module->name = strdup(name);
+    winmodule_register(module);
+    return module->handle;
+}
+WINAPI(LoadLibraryA)
+
+__winfnc void FreeLibraryAndExitThread(HANDLE module, DWORD exit_code) {
+    log_debug("FreeLibraryAndExitThread called (module=%p, exit_code=%u)", module, exit_code);
+    FreeLibrary(module);
+    pthread_exit((void*)(uintptr_t)exit_code);
+}
+WINAPI(FreeLibraryAndExitThread)
 
 __winfnc void *GetProcAddress(HANDLE handle, const char *name) {
     struct winmodule *module = (struct winmodule*) handle->data;

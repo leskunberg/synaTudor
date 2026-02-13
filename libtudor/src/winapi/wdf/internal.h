@@ -71,11 +71,12 @@ HANDLE wdf_get_driver_reg_key(struct winwdf_driver *driver);
 
 //Devices
 struct wdf_device_init;
-struct wdf_device_init *wdf_create_device_init(struct winwdf_driver *driver, HANDLE reg_key, libusb_device_handle *usb_dev, struct winwdf_device **out_dev);
+struct wdf_device_init *wdf_create_device_init(struct winwdf_driver *driver, HANDLE reg_key, int hidraw_fd, struct winwdf_device **out_dev);
 HANDLE wdf_get_device_reg_key(struct winwdf_device *driver);
 
 struct wdf_usb_device;
-libusb_device_handle *wdf_get_libusb_device(struct winwdf_device *dev);
+int wdf_get_hidraw_fd(struct winwdf_device *dev);
+bool hid_init_sensor(int fd);
 struct wdf_usb_device * wdf_get_usb_device(struct winwdf_device *dev);
 void wdf_set_usb_device(struct winwdf_device *dev, struct wdf_usb_device *usb_dev);
 

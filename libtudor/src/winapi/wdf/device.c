@@ -1,5 +1,8 @@
 #include "internal.h"
 
+/* From winapi/hiddll.c - global hidraw fd for HidD_* functions */
+extern int win_hidraw_fd;
+
 typedef enum {
   WdfPowerDeviceInvalid,
   WdfPowerDeviceD0,
@@ -76,7 +79,7 @@ typedef struct {
 struct wdf_device_init {
     struct winwdf_driver *driver;
     HANDLE reg_key;
-    libusb_device_handle *usb_dev;
+    int hidraw_fd;
 
     WDF_PNPPOWER_EVENT_CALLBACKS *pnp_callbacks;
     WDF_POWER_POLICY_EVENT_CALLBACKS *power_callbacks;
@@ -87,7 +90,7 @@ struct wdf_device_init {
     struct winwdf_device **out_dev;
 };
 
-struct wdf_device_init *wdf_create_device_init(struct winwdf_driver *driver, HANDLE reg_key, libusb_device_handle *usb_dev, struct winwdf_device **out_dev) {
+struct wdf_device_init *wdf_create_device_init(struct winwdf_driver *driver, HANDLE reg_key, int hidraw_fd, struct winwdf_device **out_dev) {
     struct wdf_device_init *dev_init = (struct wdf_device_init*) malloc(sizeof(struct wdf_device_init));
     if(!dev_init) { perror("Couldn't allocate device init object memory"); abort(); }
 
@@ -95,7 +98,7 @@ struct wdf_device_init *wdf_create_device_init(struct winwdf_driver *driver, HAN
     *dev_init = (struct wdf_device_init) {0};
     dev_init->driver = driver;
     dev_init->reg_key = reg_key;
-    dev_init->usb_dev = usb_dev;
+    dev_init->hidraw_fd = hidraw_fd;
     dev_init->out_dev = out_dev;
 
     return dev_init;
@@ -125,9 +128,9 @@ struct winwdf_device {
     struct dev_queue_node *queues_head;
     struct winwdf_queue *create_queue, *read_queue, *write_queue, *devctrl_queue, *devctrl_int_queue;
 
-    //USB
+    //Device I/O
     struct wdf_usb_device *usb_dev;
-    libusb_device_handle *libusb_dev;
+    int hidraw_fd;
 };
 
 void winwdf_remove_device(struct winwdf_device *dev) {
@@ -179,13 +182,27 @@ static void device_destr(struct winwdf_device *dev) {
 static void device_call_cbs(struct winwdf_device *dev) {
     //Call callbacks
     if(dev->pnp_callbacks) {
-        log_debug("Calling WDF device attachment callbacks...");
+        log_info("device_call_cbs: BEGIN PnP callback chain (dev=%p)", dev);
 
         NTSTATUS status = 0;
+
+        log_info("device_call_cbs: >>> EvtDevicePrepareHardware (cb=%p)", dev->pnp_callbacks->EvtDevicePrepareHardware);
         if((status = WIN_CALL_CALLBACK(dev->pnp_callbacks->EvtDevicePrepareHardware, &dev->object, NULL, NULL)) != 0) goto cbErr;
+        log_info("device_call_cbs: <<< EvtDevicePrepareHardware returned 0x%x", status);
+
+        log_info("device_call_cbs: >>> EvtDeviceD0Entry (cb=%p)", dev->pnp_callbacks->EvtDeviceD0Entry);
         if((status = WIN_CALL_CALLBACK(dev->pnp_callbacks->EvtDeviceD0Entry, &dev->object, WdfPowerDeviceD3Final)) != 0) goto cbErr;
+        log_info("device_call_cbs: <<< EvtDeviceD0Entry returned 0x%x", status);
+
+        log_info("device_call_cbs: >>> EvtDeviceD0EntryPostInterruptsEnabled (cb=%p)", dev->pnp_callbacks->EvtDeviceD0EntryPostInterruptsEnabled);
         if((status = WIN_CALL_CALLBACK(dev->pnp_callbacks->EvtDeviceD0EntryPostInterruptsEnabled, &dev->object, WdfPowerDeviceD3Final)) != 0) goto cbErr;
+        log_info("device_call_cbs: <<< EvtDeviceD0EntryPostInterruptsEnabled returned 0x%x", status);
+
+        log_info("device_call_cbs: >>> EvtDeviceSelfManagedIoInit (cb=%p)", dev->pnp_callbacks->EvtDeviceSelfManagedIoInit);
         if((status = WIN_CALL_CALLBACK(dev->pnp_callbacks->EvtDeviceSelfManagedIoInit, &dev->object)) != 0) goto cbErr;
+        log_info("device_call_cbs: <<< EvtDeviceSelfManagedIoInit returned 0x%x", status);
+
+        log_info("device_call_cbs: END PnP callback chain - all callbacks completed successfully");
 
         cbErr:;
         if(status) {
@@ -251,7 +268,7 @@ void wdf_configure_device_dispatch(struct winwdf_device *dev, struct winwdf_queu
     cant_fail_ret(pthread_mutex_unlock(&dev->queues_lock));
 }
 
-libusb_device_handle *wdf_get_libusb_device(struct winwdf_device *dev) { return dev->libusb_dev; }
+int wdf_get_hidraw_fd(struct winwdf_device *dev) { return dev->hidraw_fd; }
 
 struct wdf_usb_device * wdf_get_usb_device(struct winwdf_device *dev) { return dev->usb_dev; }
 void wdf_set_usb_device(struct winwdf_device *dev, struct wdf_usb_device *usb_dev) { dev->usb_dev = usb_dev; }
@@ -315,7 +332,17 @@ __winfnc NTSTATUS WdfDeviceCreate(WDF_DRIVER_GLOBALS *globals, struct wdf_device
     dev->create_queue = dev->read_queue = dev->write_queue = dev->devctrl_queue = dev->devctrl_int_queue = NULL;
 
     dev->usb_dev = NULL;
-    dev->libusb_dev = (*dev_init)->usb_dev;
+    dev->hidraw_fd = (*dev_init)->hidraw_fd;
+
+    /* Make hidraw fd globally available for HidD_* functions */
+    win_hidraw_fd = dev->hidraw_fd;
+
+    /* Initialize the HID sensor channel (synaptic init sequence).
+     * This must happen before the DLL tries any HID I/O. */
+    if (dev->hidraw_fd >= 0) {
+        log_info("WdfDeviceCreate: initializing HID sensor on fd=%d", dev->hidraw_fd);
+        hid_init_sensor(dev->hidraw_fd);
+    }
 
     //Enqueue callback call
     wdf_evtqueue_enqueue(&dev->object, (wdf_evtqueue_action_fnc*) device_call_cbs);
@@ -349,6 +376,93 @@ WDFFUNC(WdfDeviceStopIdleActual, 248)
 
 __winfnc void WdfDeviceResumeIdleActual(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj) {}
 WDFFUNC(WdfDeviceResumeIdleActual, 249)
+
+__winfnc void WdfDeviceSetPnpCapabilities(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *pnp_caps) {
+    log_debug("WdfDeviceSetPnpCapabilities called (stub)");
+}
+WDFFUNC(WdfDeviceSetPnpCapabilities, 33)
+
+__winfnc NTSTATUS WdfDeviceAssignInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, ULONG type, ULONG size, void *value) {
+    log_debug("WdfDeviceAssignInterfaceProperty called (stub)");
+    return STATUS_SUCCESS;
+}
+WDFFUNC(WdfDeviceAssignInterfaceProperty, 50)
+
+static NTSTATUS wdf_alloc_empty_memory(WDF_DRIVER_GLOBALS *globals, WDF_OBJECT_ATTRIBUTES *attrs, WDFOBJECT *memory) {
+    /* Create a valid but empty WDF memory object so callers don't crash */
+    struct wdf_memory *mem = (struct wdf_memory*) malloc(sizeof(struct wdf_memory));
+    if(!mem) return winerr_from_errno();
+    wdf_create_obj((struct wdf_object*) winwdf_get_driver(globals), &mem->object, NULL, attrs);
+    mem->data = calloc(1, 4);
+    mem->data_size = 0;
+    mem->owns_data = true;
+    *memory = &mem->object;
+    return STATUS_SUCCESS;
+}
+
+__winfnc NTSTATUS WdfDeviceAllocAndQueryInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, ULONG pool_type, WDF_OBJECT_ATTRIBUTES *attrs, WDFOBJECT *memory, ULONG *result_type) {
+    log_debug("WdfDeviceAllocAndQueryInterfaceProperty called (stub)");
+    if(result_type) *result_type = 0;
+    if(memory) wdf_alloc_empty_memory(globals, attrs, memory);
+    return 0xC0000225L; /* STATUS_NOT_FOUND */
+}
+WDFFUNC(WdfDeviceAllocAndQueryInterfaceProperty, 51)
+
+__winfnc NTSTATUS WdfDeviceQueryInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, ULONG size, void *value, ULONG *result_size, ULONG *result_type) {
+    log_debug("WdfDeviceQueryInterfaceProperty called (stub)");
+    if(result_size) *result_size = 0;
+    if(result_type) *result_type = 0;
+    return 0xC0000225L; /* STATUS_NOT_FOUND */
+}
+WDFFUNC(WdfDeviceQueryInterfaceProperty, 52)
+
+__winfnc NTSTATUS WdfDeviceGetDeviceStackIoType(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, ULONG *read_write_type, ULONG *ioctl_type) {
+    log_debug("WdfDeviceGetDeviceStackIoType called (stub)");
+    if(read_write_type) *read_write_type = 1; /* WdfDeviceIoBuffered */
+    if(ioctl_type) *ioctl_type = 1;
+    return STATUS_SUCCESS;
+}
+WDFFUNC(WdfDeviceGetDeviceStackIoType, 53)
+
+__winfnc NTSTATUS WdfDeviceQueryPropertyEx(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, ULONG size, void *value, ULONG *result_size, ULONG *result_type) {
+    log_debug("WdfDeviceQueryPropertyEx called (stub)");
+    if(result_size) *result_size = 0;
+    if(result_type) *result_type = 0;
+    return 0xC0000225L; /* STATUS_NOT_FOUND */
+}
+WDFFUNC(WdfDeviceQueryPropertyEx, 54)
+
+static int wdf_property_query_count = 0;
+
+__winfnc NTSTATUS WdfDeviceAllocAndQueryPropertyEx(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, ULONG pool_type, WDF_OBJECT_ATTRIBUTES *attrs, WDFOBJECT *memory, ULONG *result_type) {
+    int qnum = wdf_property_query_count++;
+    log_debug("WdfDeviceAllocAndQueryPropertyEx called (stub, query #%d)", qnum);
+
+    /* Return device instance ID as a wide string */
+    static const char16_t dev_instance_id[] = u"HID\\VID_06CB&PID_00DD\\TUDOR_FP";
+    size_t data_size = sizeof(dev_instance_id);
+
+    if(result_type) *result_type = 18; /* DEVPROP_TYPE_STRING */
+    if(memory) {
+        struct wdf_memory *mem = (struct wdf_memory*) malloc(sizeof(struct wdf_memory));
+        if(!mem) return winerr_from_errno();
+        wdf_create_obj((struct wdf_object*) winwdf_get_driver(globals), &mem->object, NULL, attrs);
+        mem->data = malloc(data_size);
+        if(!mem->data) { free(mem); return winerr_from_errno(); }
+        memcpy(mem->data, dev_instance_id, data_size);
+        mem->data_size = data_size;
+        mem->owns_data = true;
+        *memory = &mem->object;
+    }
+    return STATUS_SUCCESS;
+}
+WDFFUNC(WdfDeviceAllocAndQueryPropertyEx, 55)
+
+__winfnc NTSTATUS WdfDeviceAssignProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, ULONG type, ULONG size, void *value) {
+    log_debug("WdfDeviceAssignProperty called (stub)");
+    return STATUS_SUCCESS;
+}
+WDFFUNC(WdfDeviceAssignProperty, 56)
 
 __winfnc NTSTATUS WdfDeviceCreateDeviceInterface(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, const GUID *interface_guid, const UNICODE_STRING *ref_str) { return STATUS_SUCCESS; }
 WDFFUNC(WdfDeviceCreateDeviceInterface, 27)

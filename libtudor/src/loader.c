@@ -1,11 +1,101 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #include <tudor/log.h>
 #include "pe/pe.h"
 #include "winapi/api.h"
 #include "loader.h"
 #include "stub.h"
+
+/* CFG dispatch logging trampoline.
+ * Replaces the PE's __guard_dispatch_icall_nop (jmp rax) with a version
+ * that logs every indirect call target. This is essential for tracing
+ * virtual function calls inside the DLL. */
+static int cfg_log_count = 0;
+void cfg_dispatch_log(void *target, void *ret_addr) {
+    int n = __atomic_add_fetch(&cfg_log_count, 1, __ATOMIC_RELAXED);
+    if(n <= 500 || (n % 10000) == 0) {
+        log_debug("CFG dispatch #%d: target=%p [ret=%p] (tid=%lu)", n, target, ret_addr, (unsigned long)pthread_self());
+    }
+}
+
+/* The trampoline is written as raw x86-64 machine code.
+ * It saves all registers, calls cfg_dispatch_log, restores, and jmp rax.
+ *
+ * On entry (from DLL's `call [rip+...]`):
+ *   - rsp+0: return address (pushed by call)
+ *   - rax: target function address
+ *   - rcx,rdx,r8,r9: call arguments (Windows x64)
+ *   - rdi,rsi: may hold values (callee-saved in Windows x64)
+ */
+static void *create_cfg_trampoline(void) {
+    uint8_t *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(!page) { perror("mmap cfg trampoline"); abort(); }
+
+    uint8_t *p = page;
+
+    /* Save all potentially-used registers */
+    *p++ = 0x50;                    /* push rax */
+    *p++ = 0x51;                    /* push rcx */
+    *p++ = 0x52;                    /* push rdx */
+    *p++ = 0x41; *p++ = 0x50;      /* push r8 */
+    *p++ = 0x41; *p++ = 0x51;      /* push r9 */
+    *p++ = 0x41; *p++ = 0x52;      /* push r10 */
+    *p++ = 0x41; *p++ = 0x53;      /* push r11 */
+    *p++ = 0x57;                    /* push rdi */
+    *p++ = 0x56;                    /* push rsi */
+    /* 9 pushes = 72 bytes. Entry rsp was 8 mod 16, now rsp is (8-72)=(-64) mod 16 = 0 mod 16.
+     * Before call, rsp should be 0 mod 16 (so callee sees 8 mod 16). Aligned! */
+
+    /* mov rdi, rax  (System V arg1 = target address) */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0xc7;
+
+    /* mov rsi, [rsp+72]  (System V arg2 = return address, 9*8=72 bytes above) */
+    *p++ = 0x48; *p++ = 0x8b; *p++ = 0x74; *p++ = 0x24; *p++ = 72;
+
+    /* mov rax, <cfg_dispatch_log address> */
+    uint64_t log_addr = (uint64_t)&cfg_dispatch_log;
+    *p++ = 0x48; *p++ = 0xb8;
+    memcpy(p, &log_addr, 8); p += 8;
+
+    /* call rax */
+    *p++ = 0xff; *p++ = 0xd0;
+
+    /* Restore all registers */
+    *p++ = 0x5e;                    /* pop rsi */
+    *p++ = 0x5f;                    /* pop rdi */
+    *p++ = 0x41; *p++ = 0x5b;      /* pop r11 */
+    *p++ = 0x41; *p++ = 0x5a;      /* pop r10 */
+    *p++ = 0x41; *p++ = 0x59;      /* pop r9 */
+    *p++ = 0x41; *p++ = 0x58;      /* pop r8 */
+    *p++ = 0x5a;                    /* pop rdx */
+    *p++ = 0x59;                    /* pop rcx */
+    *p++ = 0x58;                    /* pop rax */
+
+    /* jmp rax */
+    *p++ = 0xff; *p++ = 0xe0;
+
+    log_debug("Created CFG dispatch trampoline at %p (%ld bytes)", page, (long)(p - page));
+    return page;
+}
+
+/* RVA of the CFG dispatch function pointer in synaWudfBioHid153.dll.
+ * This is __guard_dispatch_icall_fptr, which normally points to a `jmp rax` stub. */
+#define CFG_DISPATCH_PTR_RVA 0xC67B8
+
+static void patch_cfg_dispatch(uint8_t *image_mem, uint32_t image_size) {
+    if(CFG_DISPATCH_PTR_RVA + 8 > image_size) {
+        log_warn("CFG dispatch RVA out of bounds, skipping patch");
+        return;
+    }
+
+    uint64_t *dispatch_ptr = (uint64_t*)(image_mem + CFG_DISPATCH_PTR_RVA);
+    void *old_fn = (void*)*dispatch_ptr;
+    void *trampoline = create_cfg_trampoline();
+    *dispatch_ptr = (uint64_t)trampoline;
+    log_info("Patched CFG dispatch: [0x%x] %p -> %p", CFG_DISPATCH_PTR_RVA, old_fn, trampoline);
+}
 
 void register_windows_api(char *name, void *api) {
     log_verbose("Registered Windows API function %s", name);
@@ -105,6 +195,9 @@ bool load_dll(struct dll_image *dll, const char *name, uint8_t *data, uint32_t s
         }
     }
     log_debug("Applied %d relocations", pe.num_relocs);
+
+    //Patch CFG dispatch for indirect call logging
+    patch_cfg_dispatch(image_mem, pe.image_size);
 
     //Apply section protections
     log_debug("Applying memory protections to image");

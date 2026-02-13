@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <errno.h>
+#include <time.h>
 #include "internal.h"
 
 DWORD win_wait_sync_obj(HANDLE handle, DWORD timeout) {
@@ -60,6 +61,7 @@ __winfnc void DeleteCriticalSection(CRITICAL_SECTION* sect) {
 WINAPI(DeleteCriticalSection)
 
 __winfnc void EnterCriticalSection(CRITICAL_SECTION *sect) {
+    log_debug("EnterCriticalSection called (sect=%p)", sect);
     //Lock the mutex
     cant_fail_ret(pthread_mutex_lock((pthread_mutex_t*) sect->LockSemaphore));
 
@@ -67,10 +69,12 @@ __winfnc void EnterCriticalSection(CRITICAL_SECTION *sect) {
         sect->LockCount = 1;
         sect->OwningThread = (HANDLE) pthread_self();
     }
+    log_debug("EnterCriticalSection acquired (sect=%p)", sect);
 }
 WINAPI(EnterCriticalSection)
 
 __winfnc void LeaveCriticalSection(CRITICAL_SECTION *sect) {
+    void *ret_addr = __builtin_return_address(0);
     if(--sect->RecursionCount == 0) {
         sect->LockCount = 0;
         sect->OwningThread = NULL;
@@ -78,6 +82,7 @@ __winfnc void LeaveCriticalSection(CRITICAL_SECTION *sect) {
 
     //Unlock the mutex
     cant_fail_ret(pthread_mutex_unlock((pthread_mutex_t*) sect->LockSemaphore));
+    log_debug("LeaveCriticalSection (sect=%p) [ret=%p]", sect, ret_addr);
 }
 WINAPI(LeaveCriticalSection)
 
@@ -119,15 +124,17 @@ static DWORD evt_wait(struct sync_event *evt, DWORD timeout) {
     //Wait for the event
     while(!evt->state) {
         if(timeout != INFINITE) {
-            struct timespec time;
-            time.tv_nsec = timeout * 10000000L;
-            time.tv_sec = timeout / 1000L;
-            int err = pthread_cond_timedwait(&evt->cond, &evt->lock, &time);
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += timeout / 1000;
+            ts.tv_nsec += (timeout % 1000) * 1000000L;
+            if(ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            int err = pthread_cond_timedwait(&evt->cond, &evt->lock, &ts);
             if(err == ETIMEDOUT) {
                 res = WAIT_TIMEOUT;
                 break;
             }
-            cant_fail(err);
+            cant_fail_ret(err);
         } else cant_fail_ret(pthread_cond_wait(&evt->cond, &evt->lock));
     }
 
@@ -185,7 +192,9 @@ void win_reset_event(HANDLE handle) {
 }
 
 __winfnc HANDLE CreateEventA(void *attrs, BOOL manual_reset, BOOL initial_state, const char *name) {
-    return win_create_event(name, initial_state, manual_reset);
+    HANDLE h = win_create_event(name, initial_state, manual_reset);
+    log_debug("CreateEventA(name='%s', manual=%d, initial=%d) = %p", name ? name : "(null)", manual_reset, initial_state, h);
+    return h;
 }
 WINAPI(CreateEventA);
 
@@ -198,6 +207,7 @@ __winfnc HANDLE CreateEventW(void *attrs, BOOL manual_reset, BOOL initial_state,
 WINAPI(CreateEventW);
 
 __winfnc BOOL SetEvent(HANDLE handle) {
+    log_debug("SetEvent called (handle=%p)", handle);
     if(handle == INVALID_HANDLE_VALUE) return FALSE;
     win_set_event(handle);
     return TRUE;
@@ -212,9 +222,73 @@ __winfnc BOOL ResetEvent(HANDLE handle) {
 WINAPI(ResetEvent)
 
 __winfnc DWORD WaitForSingleObject(HANDLE handle, DWORD timeout) {
-    return win_wait_sync_obj(handle, timeout);
+    void *ret_addr = __builtin_return_address(0);
+    log_debug("WaitForSingleObject called (handle=%p, timeout=%u) [ret=%p] (tid=%lu)", handle, timeout, ret_addr, (unsigned long)pthread_self());
+    DWORD ret = win_wait_sync_obj(handle, timeout);
+    log_debug("WaitForSingleObject returned %u (tid=%lu)", ret, (unsigned long)pthread_self());
+    return ret;
 }
 WINAPI(WaitForSingleObject)
+
+__winfnc BOOL InitializeCriticalSectionAndSpinCount(CRITICAL_SECTION *sect, DWORD spinCount) {
+    return InitializeCriticalSectionEx(sect, spinCount, 0);
+}
+WINAPI(InitializeCriticalSectionAndSpinCount)
+
+/* Mutex implemented as a named auto-reset event */
+struct win_mutex {
+    struct win_sync_object sync_obj;
+    pthread_mutex_t lock;
+    const char *name;
+};
+
+static DWORD mutex_wait(struct win_mutex *mtx, DWORD timeout) {
+    if(timeout == INFINITE) {
+        cant_fail_ret(pthread_mutex_lock(&mtx->lock));
+        return 0;
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += timeout / 1000;
+        ts.tv_nsec += (timeout % 1000) * 1000000L;
+        if(ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        int err = pthread_mutex_timedlock(&mtx->lock, &ts);
+        if(err == ETIMEDOUT) return WAIT_TIMEOUT;
+        cant_fail(err);
+        return 0;
+    }
+}
+
+static void mutex_destr(struct win_mutex *mtx) {
+    cant_fail_ret(pthread_mutex_destroy(&mtx->lock));
+    free((void*)mtx->name);
+    free(mtx);
+}
+
+__winfnc HANDLE CreateMutexA(void *attrs, BOOL initial_owner, const char *name) {
+    struct win_mutex *mtx = (struct win_mutex*) malloc(sizeof(struct win_mutex));
+    if(!mtx) { winerr_set_errno(); return NULL; }
+    mtx->sync_obj.wait_fnc = (win_sync_obj_wait_fnc*) mutex_wait;
+    mtx->name = name ? strdup(name) : NULL;
+
+    pthread_mutexattr_t mattr;
+    cant_fail_ret(pthread_mutexattr_init(&mattr));
+    cant_fail_ret(pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE));
+    cant_fail_ret(pthread_mutex_init(&mtx->lock, &mattr));
+    cant_fail_ret(pthread_mutexattr_destroy(&mattr));
+
+    if(initial_owner) cant_fail_ret(pthread_mutex_lock(&mtx->lock));
+
+    return winhandle_create(mtx, (winhandle_destr_fnc*) mutex_destr);
+}
+WINAPI(CreateMutexA)
+
+__winfnc BOOL ReleaseMutex(HANDLE handle) {
+    struct win_mutex *mtx = (struct win_mutex*) handle->data;
+    cant_fail_ret(pthread_mutex_unlock(&mtx->lock));
+    return TRUE;
+}
+WINAPI(ReleaseMutex)
 
 #define NUM_FLS_IDXS 128
 #define FLS_OUT_OF_INDEXES 0xffffffff

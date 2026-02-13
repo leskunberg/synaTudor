@@ -58,6 +58,9 @@ struct winmodule {
     const char *name;
     const char *cmdline;
     const char **environ;
+
+    void *image_base;   /* PE image base address (NULL if not a PE module) */
+    size_t image_size;  /* PE image size in bytes */
 };
 
 struct winmodule *winmodule_find(const char *name);

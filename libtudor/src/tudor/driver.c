@@ -1,26 +1,26 @@
 #include "internal.h"
 
-extern uint8_t _binary_libtudor_synaFpAdapter104_dll_start, _binary_libtudor_synaFpAdapter104_dll_end;
-extern uint8_t _binary_libtudor_synaWudfBioUsb104_dll_start, _binary_libtudor_synaWudfBioUsb104_dll_end;
+extern uint8_t _binary_synaFpAdapter153_dll_start, _binary_synaFpAdapter153_dll_end;
+extern uint8_t _binary_synaWudfBioHid153_dll_start, _binary_synaWudfBioHid153_dll_end;
 
 #define NUM_WINDRV_DLLS 2
 struct windrv_dll tudor_windrv_dlls[] = {
     {
         .module = {
-            .name = "synaFpAdapter104.dll",
-            .cmdline = "synaFpAdapter104.dll",
+            .name = "synaFpAdapter153.dll",
+            .cmdline = "synaFpAdapter153.dll",
             .environ = (const char*[]) { NULL }
         },
-        .pe_image = &_binary_libtudor_synaFpAdapter104_dll_start, .pe_image_end = &_binary_libtudor_synaFpAdapter104_dll_end,
+        .pe_image = &_binary_synaFpAdapter153_dll_start, .pe_image_end = &_binary_synaFpAdapter153_dll_end,
         .is_adapter = true, .is_driver = false
     },
     {
         .module = {
-            .name = "synaWudfBioUsb104.dll",
-            .cmdline = "synaWudfBioUsb104.dll",
+            .name = "synaWudfBioHid153.dll",
+            .cmdline = "synaWudfBioHid153.dll",
             .environ = (const char*[]) { NULL }
         },
-        .pe_image = &_binary_libtudor_synaWudfBioUsb104_dll_start, .pe_image_end = &_binary_libtudor_synaWudfBioUsb104_dll_end,
+        .pe_image = &_binary_synaWudfBioHid153_dll_start, .pe_image_end = &_binary_synaWudfBioHid153_dll_end,
         .is_adapter = false, .is_driver = true
     }
 };
@@ -42,6 +42,7 @@ typedef BOOL __winfnc (*api_DllMain)(HANDLE hinstDLL, int fdwReason, void *lpRes
 struct windrv_dll *tudor_adapter_dll, *tudor_driver_dll;
 WINBIO_SENSOR_INTERFACE *tudor_sensor_adapter;
 WINBIO_ENGINE_INTERFACE *tudor_engine_adapter;
+WINBIO_STORAGE_INTERFACE *tudor_dll_storage_adapter;
 
 static DRIVER_OBJECT umdf_driver;
 struct winwdf_driver *tudor_wdf_driver;
@@ -75,8 +76,10 @@ bool tudor_init() {
             log_error("Error loading driver DLL!");
             return false;
         }
+        dll->module.image_base = dll->image.base_addr;
+        dll->module.image_size = dll->image.image_size;
         winmodule_register(&dll->module);
-        log_info("Loaded driver DLL '%s' [%ld bytes]", dll->module.name, dll->pe_image_end - dll->pe_image);
+        log_info("Loaded driver DLL '%s' [%ld bytes] at %p-%p", dll->module.name, dll->pe_image_end - dll->pe_image, dll->image.base_addr, (uint8_t*)dll->image.base_addr + dll->image.image_size);
 
         if(dll->is_adapter) tudor_adapter_dll = dll;
         if(dll->is_driver) tudor_driver_dll = dll;
@@ -133,6 +136,20 @@ bool tudor_init() {
     if((hres = ((api_WbioQueryEngineInterface) find_dll_export(&tudor_adapter_dll->image, "WbioQueryEngineInterface"))(&tudor_engine_adapter)) != 0) {
         log_error("Error querying engine interface: 0x%x!", hres);
         return false;
+    }
+
+    //Query the DLL's storage adapter for sensor-side template management
+    void *storage_query = find_dll_export(&tudor_adapter_dll->image, "WbioQueryStorageInterface");
+    if(storage_query) {
+        if((hres = ((api_WbioQueryStorageInterface) storage_query)(&tudor_dll_storage_adapter)) != 0) {
+            log_warn("Error querying DLL storage interface: 0x%x (sensor-side template deletion unavailable)", hres);
+            tudor_dll_storage_adapter = NULL;
+        } else {
+            log_info("Got DLL storage adapter at %p", tudor_dll_storage_adapter);
+        }
+    } else {
+        log_warn("DLL does not export WbioQueryStorageInterface");
+        tudor_dll_storage_adapter = NULL;
     }
 
     return true;

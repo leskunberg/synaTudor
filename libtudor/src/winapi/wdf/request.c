@@ -164,19 +164,25 @@ void wdf_configure_request(struct winwdf_request *req, struct winwdf_queue *io_q
 }
 
 void wdf_start_request(struct winwdf_request *req, struct wdf_object *target, int timeout) {
+    log_info("wdf_start_request: ENTER (req=%p, target=%p, timeout=%d, start_fnc=%p)", req, target, timeout, req->start_fnc);
     cant_fail_ret(pthread_mutex_lock(&req->lock));
     if(req->is_configured && !req->is_started) {
-        if(req->start_fnc) req->status = req->start_fnc(req, req->context, target, timeout, &req->data);
-        else {
+        if(req->start_fnc) {
+            log_info("wdf_start_request: calling start_fnc=%p", req->start_fnc);
+            req->status = req->start_fnc(req, req->context, target, timeout, &req->data);
+            log_info("wdf_start_request: start_fnc returned status=0x%x", req->status);
+        } else {
             req->status = 0;
             req->data = NULL;
         }
         req->is_started = true;
     }
     cant_fail_ret(pthread_mutex_unlock(&req->lock));
+    log_info("wdf_start_request: EXIT");
 }
 
 void wdf_complete_request(struct winwdf_request *req, NTSTATUS status, WDF_REQUEST_COMPLETION_PARAMS *params) {
+    log_info("wdf_complete_request: ENTER (req=%p, status=0x%x)", req, status);
     cant_fail_ret(pthread_mutex_lock(&req->lock));
 
     if(!req->is_configured || !req->is_started || req->is_done) {
@@ -264,15 +270,19 @@ void winwdf_cancel_request(struct winwdf_request *req) {
 }
 
 NTSTATUS winwdf_wait_request(struct winwdf_request *req) {
+    log_info("winwdf_wait_request: ENTER (req=%p, configured=%d, started=%d, done=%d)", req, req->is_configured, req->is_started, req->is_done);
     cant_fail_ret(pthread_mutex_lock(&req->lock));
 
     NTSTATUS status = WINERR_SET_CODE;
     if(req->is_configured) {
+        if(!req->is_done) log_info("winwdf_wait_request: >>> BLOCKING on pthread_cond_wait (req=%p, tid=%lu)", req, (unsigned long)pthread_self());
         while(req->is_configured && !req->is_done) cant_fail_ret(pthread_cond_wait(&req->compl_cond, &req->lock));
         status = req->status;
+        log_info("winwdf_wait_request: <<< unblocked, status=0x%x", status);
     }
 
     cant_fail_ret(pthread_mutex_unlock(&req->lock));
+    log_info("winwdf_wait_request: EXIT (status=0x%x)", status);
     return status;
 }
 
@@ -364,6 +374,8 @@ WDFFUNC(WdfRequestUnmarkCancelable, 156)
 __winfnc BOOLEAN WdfRequestSend(WDF_DRIVER_GLOBALS *globals, WDFOBJECT req_obj, WDFOBJECT target, WDF_REQUEST_SEND_OPTIONS *opts) {
     struct winwdf_request *req = (struct winwdf_request*) req_obj;
 
+    log_debug("WdfRequestSend called (req=%p, target=%p, flags=0x%x)", req_obj, target, opts ? opts->Flags : 0);
+
     //Determine the timeout
     int timeout = -1;
     if(opts->Flags & WDF_REQUEST_SEND_OPTION_TIMEOUT) {
@@ -373,6 +385,7 @@ __winfnc BOOLEAN WdfRequestSend(WDF_DRIVER_GLOBALS *globals, WDFOBJECT req_obj, 
 
     cant_fail_ret(pthread_mutex_lock(&req->lock));
     if(!req->is_configured || req->is_started) {
+        log_debug("WdfRequestSend: not configured or already started");
         cant_fail_ret(pthread_mutex_unlock(&req->lock));
         return FALSE;
     }
@@ -389,14 +402,20 @@ __winfnc BOOLEAN WdfRequestSend(WDF_DRIVER_GLOBALS *globals, WDFOBJECT req_obj, 
         req->is_started = true;
 
         if(opts->Flags & WDF_REQUEST_SEND_OPTION_SYNCHRONOUS) {
+            log_debug("WdfRequestSend: waiting SYNCHRONOUS...");
             //Wait for the request to be completed
             while(req->is_configured && !req->is_done) cant_fail_ret(pthread_cond_wait(&req->compl_cond, &req->lock));
             status = req->status;
+            log_debug("WdfRequestSend: SYNCHRONOUS done, status=0x%x", status);
         }
-    } else req->is_done = true;
+    } else {
+        log_debug("WdfRequestSend: start_fnc returned error 0x%x", status);
+        req->is_done = true;
+    }
 
     cant_fail_ret(pthread_mutex_unlock(&req->lock));
 
+    log_debug("WdfRequestSend returning %d", status == STATUS_SUCCESS);
     return status == STATUS_SUCCESS;
 }
 WDFFUNC(WdfRequestSend, 152)

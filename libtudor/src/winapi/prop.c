@@ -32,3 +32,13 @@ __winfnc HRESULT PropVariantClear(PROPVARIANT *pvar) {
     return ERROR_SUCCESS;
 }
 WINAPI(PropVariantClear)
+
+__winfnc void *CoTaskMemAlloc(SIZE_T size) {
+    return malloc(size);
+}
+WINAPI(CoTaskMemAlloc)
+
+__winfnc void CoTaskMemFree(void *mem) {
+    free(mem);
+}
+WINAPI(CoTaskMemFree)

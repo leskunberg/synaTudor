@@ -14,29 +14,39 @@ static struct wdf_evtqueue_action *queue_head = NULL;
 void winwdf_event_queue_flush() {
     WIN_CLOBBER_NONVOL_REGS
 
+    log_info("winwdf_event_queue_flush: ENTER (queue_head=%p)", queue_head);
     cant_fail_ret(pthread_mutex_lock(&queue_mutex));
     flushing_queue = true;
 
     //Flush the queue
-    if(queue_head) log_debug("Flushing WDF event queue...");
+    if(queue_head) log_info("winwdf_event_queue_flush: Flushing WDF event queue...");
+    int action_idx = 0;
     while(queue_head) {
         struct wdf_evtqueue_action *act = queue_head;
         queue_head = act->next;
 
         if(act->object) {
+            log_info("winwdf_event_queue_flush: >>> dispatching action #%d (obj=%p, action=%p)", action_idx, act->object, act->action);
             act->object->evtqueue_acts_head = act->obj_next;
             act->action(act->object);
+            log_info("winwdf_event_queue_flush: <<< action #%d returned", action_idx);
+        } else {
+            log_info("winwdf_event_queue_flush: skipping action #%d (null object)", action_idx);
         }
 
         free(act);
+        action_idx++;
     }
 
     flushing_queue = false;
     cant_fail_ret(pthread_mutex_unlock(&queue_mutex));
+    log_info("winwdf_event_queue_flush: EXIT (dispatched %d actions)", action_idx);
 }
 
 void wdf_evtqueue_enqueue(struct wdf_object *obj, wdf_evtqueue_action_fnc *action) {
     WIN_CLOBBER_NONVOL_REGS
+
+    log_info("wdf_evtqueue_enqueue: enqueueing action=%p for obj=%p", action, obj);
 
     //Create action object
     struct wdf_evtqueue_action *act = (struct wdf_evtqueue_action*) malloc(sizeof(struct wdf_evtqueue_action));

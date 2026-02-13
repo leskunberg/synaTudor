@@ -6,6 +6,22 @@ void (*tudor_set_pdata_fnc)(const char *name, const struct tudor_pair_data *pdat
 bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const char *val_name, bool is_write, void *buf, size_t *buf_size, enum winreg_val_type *val_type) {
     if(!buf_size) return false;
 
+    //Handle MachineGuid
+    if(!is_write && strcmp(key_name, "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography") == 0) {
+        if(strcmp(val_name, "MachineGuid") == 0) {
+            /* Return a fake but consistent machine GUID */
+            static const char16_t guid[] = u"a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+            size_t data_size = sizeof(guid);
+            if(buf && *buf_size >= data_size) {
+                memcpy(buf, guid, data_size);
+            } else if(buf) return false;
+            *buf_size = data_size;
+            *val_type = WINREG_STR;
+            return true;
+        }
+        return false;
+    }
+
     //Handle the driver configuration key
     if(!is_write && strcmp(key_name, "HKEY_LOCAL_MACHINE\\SOFTWARE\\Syna") == 0) {
         if(strcmp(val_name, "wbfMode") == 0) {

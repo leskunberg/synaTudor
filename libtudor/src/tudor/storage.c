@@ -1,16 +1,41 @@
 #include "internal.h"
 
 int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger) {
+    if(device->use_dll_storage) {
+        //Use DLL's storage adapter DeleteRecord
+        winmodule_set_cur(&tudor_adapter_dll->module);
+        WINBIO_STORAGE_INTERFACE *storage = device->pipeline->StorageInterface;
+
+        WINBIO_IDENTITY ident;
+        if(guid) {
+            ident.Type = WINBIO_ID_TYPE_GUID;
+            ident.TemplateGuid = *(GUID*)(void*)guid;
+        } else {
+            ident.Type = WINBIO_ID_TYPE_WILDCARD;
+            ident.Wildcard = 0x25066282; // WINBIO_IDENTITY_WILDCARD
+        }
+
+        //First count how many records match (for return value)
+        int count = tudor_enumerate_records(device, guid, finger, NULL, NULL);
+
+        UCHAR subfactor = (finger == TUDOR_FINGER_ANY) ? 0xFF : (UCHAR)finger;
+        HRESULT hr = storage->DeleteRecord(device->pipeline, &ident, subfactor);
+        if(hr != ERROR_SUCCESS) {
+            log_warn("tudor_wipe_records: DeleteRecord failed: 0x%08x", hr);
+            return 0;
+        }
+        return count;
+    }
+
+    //Fallback: in-memory linked list
     cant_fail_ret(pthread_mutex_lock(&device->records_lock));
 
-    //Find the record
     int num_deleted = 0;
     for(struct tudor_record *rec = device->records_head, *nrec = rec ? rec->next : NULL; rec; rec = nrec, nrec = rec ? rec->next : NULL) {
         if(
-            (guid == NULL || memcmp(&rec->identity->TemplateGuid, guid, sizeof(GUID)) == 0) && 
+            (guid == NULL || memcmp(&rec->identity->TemplateGuid, guid, sizeof(GUID)) == 0) &&
             (finger == TUDOR_FINGER_ANY || rec->finger == finger)
         ) {
-            //Remove from record list
             if(rec->prev) rec->prev->next = rec->next;
             else device->records_head = rec->next;
             if(rec->next) rec->next->prev = rec->prev;
@@ -116,6 +141,7 @@ __winfnc static HRESULT storage_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STOR
     rec->identity = (WINBIO_IDENTITY*) malloc(sizeof(WINBIO_IDENTITY));
     if(!rec->identity) {
         HRESULT hr = winerr_from_errno();
+        free(rec);
         cant_fail_ret(pthread_mutex_unlock(&dev->records_lock));
         return hr;
     }
@@ -127,6 +153,7 @@ __winfnc static HRESULT storage_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STOR
     rec->data_size = srec->TemplateBlobSize;
     if(!rec->data) {
         HRESULT hr = winerr_from_errno();
+        free(rec->identity);
         free(rec);
         cant_fail_ret(pthread_mutex_unlock(&dev->records_lock));
         return hr;

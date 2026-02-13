@@ -19,7 +19,9 @@ static void file_destr(struct winwdf_file *file) {
 }
 
 NTSTATUS winwdf_open_device(struct winwdf_device *device, struct winwdf_file **out) {
+    log_info("winwdf_open_device: ENTER (device=%p)", device);
     struct winwdf_queue *create_queue = wdf_get_dispatch_queue(device, WDF_QUEUE_REQ_CREATE);
+    log_info("winwdf_open_device: create_queue=%p", create_queue);
 
     //Allocate the file object
     struct winwdf_file *file = (struct winwdf_file*) malloc(sizeof(struct winwdf_file));
@@ -29,6 +31,7 @@ NTSTATUS winwdf_open_device(struct winwdf_device *device, struct winwdf_file **o
     file->device = device;
 
     //Create request
+    log_info("winwdf_open_device: creating and starting file-create request...");
     struct winwdf_request *req = wdf_create_request(&file->object, wdf_get_fs_obj_attrs(device));
     wdf_configure_request(req, create_queue, file, 0, 0, NULL, NULL, NULL, &(WDF_REQUEST_PARAMETERS) {
         .Size = sizeof(WDF_REQUEST_PARAMETERS),
@@ -45,15 +48,23 @@ NTSTATUS winwdf_open_device(struct winwdf_device *device, struct winwdf_file **o
     //Call callbacks
     WDF_FILEOBJECT_CONFIG *cfg = wdf_get_fs_config(device);
     if(create_queue) {
+        log_info("winwdf_open_device: dispatching to create_queue...");
         wdf_queue_create(create_queue, req);
-    } else if(cfg) {
-        if(cfg->EvtDeviceFileCreate) cfg->EvtDeviceFileCreate((WDFOBJECT) device, (WDFOBJECT) req, &file->object);
+    } else if(cfg && cfg->EvtDeviceFileCreate) {
+        log_info("winwdf_open_device: calling EvtDeviceFileCreate...");
+        cfg->EvtDeviceFileCreate((WDFOBJECT) device, (WDFOBJECT) req, &file->object);
+    } else {
+        log_info("winwdf_open_device: no create queue or EvtDeviceFileCreate - auto-completing request");
+        wdf_complete_request(req, STATUS_SUCCESS, NULL);
     }
 
+    log_info("winwdf_open_device: waiting for request completion...");
     NTSTATUS status = winwdf_wait_request(req);
+    log_info("winwdf_open_device: request completed with status=0x%x", status);
     if(status == STATUS_SUCCESS) *out = file;
 
     winwdf_destroy_object((WDFOBJECT) req);
+    log_info("winwdf_open_device: EXIT (status=0x%x)", status);
     return status;
 }
 

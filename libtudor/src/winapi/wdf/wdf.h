@@ -1,7 +1,6 @@
 #ifndef LIBTUDOR_WINAPI_WDF_WDF_H
 #define LIBTUDOR_WINAPI_WDF_WDF_H
 
-#include <libusb.h>
 #include "winwdf.h"
 
 //Functions
@@ -22,7 +21,7 @@ void winwdf_unload_driver(struct winwdf_driver *driver);
 
 //Devices
 struct winwdf_device;
-NTSTATUS winwdf_add_device(struct winwdf_driver *driver, HANDLE reg_key, libusb_device_handle *usb_dev, struct winwdf_device **dev);
+NTSTATUS winwdf_add_device(struct winwdf_driver *driver, HANDLE reg_key, int hidraw_fd, struct winwdf_device **dev);
 void winwdf_remove_device(struct winwdf_device *device);
 
 //Requests

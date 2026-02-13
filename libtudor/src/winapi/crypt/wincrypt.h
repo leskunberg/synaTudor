@@ -190,4 +190,21 @@ typedef struct {
 
 #define X509_ECC_SIGNATURE 47
 
+/* CryptSetKeyParam / CryptGetKeyParam parameter IDs */
+#define KP_IV           1
+#define KP_SALT         2
+#define KP_PADDING      3
+#define KP_MODE         4
+#define KP_MODE_BITS    5
+#define KP_ALGID        6
+#define KP_BLOCKLEN     8
+#define KP_KEYLEN       9
+
+/* Cipher modes */
+#define CRYPT_MODE_CBC  1
+#define CRYPT_MODE_ECB  2
+#define CRYPT_MODE_OFB  3
+#define CRYPT_MODE_CFB  4
+#define CRYPT_MODE_CTS  5
+
 #endif

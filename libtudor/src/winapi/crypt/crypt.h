@@ -22,6 +22,11 @@ struct crypt_key {
 
     void *plain_data;
     size_t plain_size;
+
+    ALG_ID alg_id;
+    DWORD mode;     /* CRYPT_MODE_CBC etc, default CBC */
+    BYTE iv[16];    /* AES block size */
+    bool iv_set;
 };
 
 extern struct crypt_provider crypt_prov_rsa_aes;

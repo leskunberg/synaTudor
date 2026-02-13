@@ -103,7 +103,15 @@ void wdf_destroy_obj_list(struct wdf_object_list *list) {
     cant_fail_ret(pthread_rwlock_wrlock(&list->lock));
 
     list->dead = true;
-    while(list->head) winwdf_destroy_object(list->head);
+    while(list->head) {
+        struct wdf_object *obj = list->head;
+        //Advance head before destroying — the child skips list removal
+        //when dead=true, so we must unlink it ourselves.
+        list->head = obj->next;
+        if(list->head) list->head->prev = NULL;
+        obj->parent_list = NULL;
+        winwdf_destroy_object(obj);
+    }
 
     cant_fail_ret(pthread_rwlock_unlock(&list->lock));
 
@@ -162,3 +170,21 @@ __winfnc void *WdfObjectGetTypedContextWorker(WDF_DRIVER_GLOBALS *globals, struc
     return ctx_data;
 }
 WDFFUNC(WdfObjectGetTypedContextWorker, 123)
+
+__winfnc WDFOBJECT WdfObjectContextGetObject(WDF_DRIVER_GLOBALS *globals, void *context) {
+    /* Context data is embedded in the object - walk back to find it.
+       For now, log and return NULL since this is complex to implement properly. */
+    log_warn("WdfObjectContextGetObject called (stub) - returning NULL");
+    return NULL;
+}
+WDFFUNC(WdfObjectContextGetObject, 125)
+
+__winfnc void WdfObjectReferenceActual(WDF_DRIVER_GLOBALS *globals, WDFOBJECT obj, void *tag, LONG line, const char *file) {
+    /* Reference counting stub - we don't track references */
+}
+WDFFUNC(WdfObjectReferenceActual, 126)
+
+__winfnc void WdfObjectDereferenceActual(WDF_DRIVER_GLOBALS *globals, WDFOBJECT obj, void *tag, LONG line, const char *file) {
+    /* Dereference counting stub */
+}
+WDFFUNC(WdfObjectDereferenceActual, 127)

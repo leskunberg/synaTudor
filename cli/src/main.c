@@ -1,18 +1,90 @@
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+#include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
-#include <libusb.h>
+#include <ucontext.h>
+#include <execinfo.h>
 
 #include <tudor/log.h>
 #include <tudor/libcrypto.h>
 #include <tudor/tudor.h>
 #include "datastore.h"
 #include "cli.h"
+#include "hidraw_detect.h"
 
-#define TUDOR_VID 0x06cb
-#define TUDOR_PID 0x00be
+/* From fileops.c — image channel fd and shutdown flag */
+extern int win_hidraw_fd_img;
+extern volatile bool tudor_shutting_down;
+
+static void segfault_handler(int sig, siginfo_t *info, void *ucontext) {
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    void *pc = (void *)uc->uc_mcontext.gregs[REG_RIP];
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    pid_t pid = getpid();
+    fprintf(stderr, "\n[CRASH] SIGSEGV at PC=%p, fault addr=%p (pid=%d, tid=%d, %s)\n",
+        pc, info->si_addr, pid, tid, (tid == pid) ? "MAIN THREAD" : "BACKGROUND THREAD");
+
+    /* Print some register context */
+    fprintf(stderr, "[CRASH] RAX=%016lx RBX=%016lx RCX=%016lx RDX=%016lx\n",
+        (unsigned long)uc->uc_mcontext.gregs[REG_RAX],
+        (unsigned long)uc->uc_mcontext.gregs[REG_RBX],
+        (unsigned long)uc->uc_mcontext.gregs[REG_RCX],
+        (unsigned long)uc->uc_mcontext.gregs[REG_RDX]);
+    fprintf(stderr, "[CRASH] RSI=%016lx RDI=%016lx RSP=%016lx RBP=%016lx\n",
+        (unsigned long)uc->uc_mcontext.gregs[REG_RSI],
+        (unsigned long)uc->uc_mcontext.gregs[REG_RDI],
+        (unsigned long)uc->uc_mcontext.gregs[REG_RSP],
+        (unsigned long)uc->uc_mcontext.gregs[REG_RBP]);
+    fprintf(stderr, "[CRASH] R8 =%016lx R9 =%016lx R10=%016lx R11=%016lx\n",
+        (unsigned long)uc->uc_mcontext.gregs[REG_R8],
+        (unsigned long)uc->uc_mcontext.gregs[REG_R9],
+        (unsigned long)uc->uc_mcontext.gregs[REG_R10],
+        (unsigned long)uc->uc_mcontext.gregs[REG_R11]);
+
+    /* Print backtrace */
+    fprintf(stderr, "[CRASH] Backtrace:\n");
+    void *bt[32];
+    int bt_size = backtrace(bt, 32);
+    /* Replace first frame with actual crash PC */
+    if (bt_size > 0) bt[0] = pc;
+    char **bt_syms = backtrace_symbols(bt, bt_size);
+    for (int i = 0; i < bt_size; i++) {
+        fprintf(stderr, "  [%d] %s\n", i, bt_syms ? bt_syms[i] : "???");
+    }
+    if (bt_syms) free(bt_syms);
+
+    /* Print /proc/self/maps for address mapping */
+    fprintf(stderr, "[CRASH] Memory maps around PC and backtrace:\n");
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long start, end;
+            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                if ((unsigned long)pc >= start && (unsigned long)pc < end) {
+                    fprintf(stderr, "  >>> %s", line);
+                } else if (info->si_addr && (unsigned long)info->si_addr >= start && (unsigned long)info->si_addr < end) {
+                    fprintf(stderr, "  *>> %s", line);
+                }
+                /* Also check backtrace frames */
+                for (int i = 1; i < bt_size; i++) {
+                    if ((unsigned long)bt[i] >= start && (unsigned long)bt[i] < end) {
+                        fprintf(stderr, "  [%d] %s", i, line);
+                        break;
+                    }
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    _exit(139);
+}
 
 static bool drop_root_priv() {
     if(geteuid() == 0 || getegid() == 0) {
@@ -49,84 +121,46 @@ static bool drop_root_priv() {
     return true;
 }
 
-static libusb_device_handle *open_sensor_device(libusb_context *usb_ctx, int vid, int pid) {
-    int usb_err;
-
-    //Find the sensor device
-    libusb_device **usb_devs;
-    ssize_t num_usb_devs = libusb_get_device_list(usb_ctx, &usb_devs);
-    if(num_usb_devs < 0) {
-        log_error("Error getting USB device list: %d [%s]", (int) num_usb_devs, libusb_error_name(num_usb_devs));
-        return NULL;
-    }
-
-    libusb_device *sensor_dev = NULL;
-    for(int i = 0; i < num_usb_devs; i++) {
-        libusb_device *dev = usb_devs[i];
-
-        //Get device properties
-        struct libusb_device_descriptor dev_descr;
-        if((usb_err = libusb_get_device_descriptor(dev, &dev_descr)) != 0) {
-            log_error("Error getting USB device descriptor: %d [%s]", usb_err, libusb_error_name(usb_err));
-            return NULL;
-        }
-
-        //Check VID and PID
-        if(dev_descr.idVendor != vid || dev_descr.idProduct != pid) continue;
-
-        sensor_dev = dev;
-        log_info("Found sensor USB device [bus %d addr %d vid 0x%04x pid 0x%04x]", (int) libusb_get_bus_number(dev), (int) libusb_get_device_address(dev), (int) dev_descr.idVendor, (int) dev_descr.idProduct);
-        break;
-    }
-
-    libusb_free_device_list(usb_devs, true);
-
-    if(!sensor_dev) {
-        log_error("Couldn't find sensor USB device! [vid 0x%04x pid 0x%04x]", vid, pid);
-        return NULL;
-    }
-
-    //Open the sensor device
-    log_info("Opening sensor USB device...");
-    libusb_device_handle *sensor_handle;
-    if((usb_err = libusb_open(sensor_dev, &sensor_handle)) != 0) {
-        log_error("Error opening sensor USB device: %d [%s]", usb_err, libusb_error_name(usb_err));
-        return NULL;
-    }
-
-    return sensor_handle;
-}
-
-static bool libusb_poll_thread_exit = false;
-static void *libusb_poll_thread_func(void *arg) {
-    while(!libusb_poll_thread_exit) {
-        int usb_err;
-        if((usb_err = libusb_handle_events((libusb_context*) arg)) != 0) {
-            log_warn("Error in libusb polling thread: %d [%s]", usb_err, libusb_error_name(usb_err));
-        }
-    }
-    return NULL;
-}
-
 int main(int argc, char **argv) {
     //Parse arguments
     if(argc < 2) {
         log_error("Usage: %s <data store> [flags]", argv[0]);
+        log_error("Flags: -v verbose  -q quiet  -t traces  -H <hidraw_cmd>  -I <hidraw_img>");
         return EXIT_FAILURE;
     }
 
-    int sensor_vid = TUDOR_VID, sensor_pid = TUDOR_PID;
+    const char *hidraw_path = NULL;
+    const char *hidraw_img_path = NULL;
     for(int i = 2; i < argc; i++) {
         for(char *p = argv[i]+1; *p; p++) {
-            if(*p == 'v' && LOG_LEVEL > LOG_VERBOSE) LOG_LEVEL--; 
+            if(*p == 'v' && LOG_LEVEL > LOG_VERBOSE) LOG_LEVEL--;
             if(*p == 'q' && LOG_LEVEL < LOG_ERROR) LOG_LEVEL++;
             if(*p == 't') tudor_log_traces = true;
-            if(*p == 'V') { sensor_vid = strtol(p+1, NULL, 16); break; }
-            if(*p == 'P') { sensor_pid = strtol(p+1, NULL, 16); break; }
+            if(*p == 'H') { hidraw_path = p+1; if(!*hidraw_path && i+1 < argc) hidraw_path = argv[++i]; break; }
+            if(*p == 'I') { hidraw_img_path = p+1; if(!*hidraw_img_path && i+1 < argc) hidraw_img_path = argv[++i]; break; }
         }
     }
-    sensor_vid &= 0xffff;
-    sensor_pid &= 0xffff;
+
+    //Auto-detect hidraw devices if not specified on command line
+    struct hidraw_detect_result detect = {0};
+    if(!hidraw_path) {
+        if(hidraw_autodetect(&detect)) {
+            hidraw_path = detect.cmd_path;
+            if(!hidraw_img_path)
+                hidraw_img_path = detect.img_path;
+            log_info("Auto-detected: cmd=%s img=%s", hidraw_path, hidraw_img_path);
+        } else {
+            log_error("No fingerprint sensor found! Specify device with -H <hidraw_cmd> [-I <hidraw_img>]");
+            return EXIT_FAILURE;
+        }
+    }
+    if(!hidraw_img_path) hidraw_img_path = hidraw_path;
+
+    //Install SIGSEGV handler for debugging
+    struct sigaction sa = {0};
+    sa.sa_sigaction = segfault_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
 
     //Ask if one wants to really use this
     puts(">>>>> WARNING <<<<<");
@@ -136,7 +170,7 @@ int main(int argc, char **argv) {
     printf("Press 'y' to continue, any key to exit: ");
     char chr = 0;
     scanf("%c", &chr);
-    if(chr != 'y') { 
+    if(chr != 'y') {
         puts("Exiting....");
         return EXIT_FAILURE;
     }
@@ -146,25 +180,29 @@ int main(int argc, char **argv) {
     ERR_load_crypto_strings();
     OpenSSL_add_all_algorithms();
 
-    //Initialize libusb
-    log_info("Initializing libusb...");
-    libusb_context *usb_ctx;
-    int usb_err;
-    if((usb_err = libusb_init(&usb_ctx)) != 0) {
-        log_error("Error initializing libusb: %d [%s]", usb_err, libusb_error_name(usb_err));
+    //Open the HID command channel device
+    log_info("Opening HID command channel %s...", hidraw_path);
+    int hidraw_fd = open(hidraw_path, O_RDWR | O_NONBLOCK);
+    if(hidraw_fd < 0) {
+        log_error("Error opening HID device %s: %s", hidraw_path, strerror(errno));
         return EXIT_FAILURE;
     }
+    log_info("Opened HID command channel %s (fd %d)", hidraw_path, hidraw_fd);
 
-    //Open the sensor device
-    libusb_device_handle *usb_dev = open_sensor_device(usb_ctx, sensor_vid, sensor_pid);
-    if(!usb_dev) return EXIT_FAILURE;
+    //Open the HID image channel device
+    log_info("Opening HID image channel %s...", hidraw_img_path);
+    int hidraw_img_fd = open(hidraw_img_path, O_RDWR | O_NONBLOCK);
+    if(hidraw_img_fd < 0) {
+        log_warn("Could not open HID image channel %s: %s (continuing without it)", hidraw_img_path, strerror(errno));
+        hidraw_img_fd = -1;
+    } else {
+        log_info("Opened HID image channel %s (fd %d)", hidraw_img_path, hidraw_img_fd);
+    }
+    /* Set the image channel fd globally before tudor_open */
+    win_hidraw_fd_img = hidraw_img_fd;
 
     //Drop root privileges (if we have them)
     if(!drop_root_priv()) return EXIT_FAILURE;
-
-    //Start the libusb polling thread
-    pthread_t usb_poll_thread;
-    cant_fail_ret(pthread_create(&usb_poll_thread, NULL, libusb_poll_thread_func, usb_ctx));
 
     //Initialize tudor driver
     tudor_get_pdata_fnc = get_pair_data;
@@ -193,7 +231,7 @@ int main(int argc, char **argv) {
     //Open the device
     log_info("Opening tudor device...");
     struct tudor_device device;
-    if(!tudor_open(&device, usb_dev, NULL)) {
+    if(!tudor_open(&device, hidraw_fd, NULL)) {
         log_error("Error opening tudor device!");
         return EXIT_FAILURE;
     }
@@ -230,28 +268,31 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    //Close the device
+    //Close the device (pipeline teardown) — fds still valid, shutdown flag NOT set,
+    //so DLL teardown reads/writes work normally against the live hidraw device.
     log_info("Closing tudor device...");
-    if(!tudor_close(&device)) {
-        log_error("Error closing tudor device!");
-        return EXIT_FAILURE;
-    }
+    tudor_close(&device);
 
-    //Shutdown tudor driver
+    //Now signal background threads to stop and close fds
+    log_info("Signaling shutdown...");
+    tudor_shutting_down = true;
+
+    log_info("Closing hidraw fds...");
+    close(hidraw_fd);
+    if(hidraw_img_fd >= 0 && hidraw_img_fd != hidraw_fd)
+        close(hidraw_img_fd);
+
+    //Brief wait for background threads to notice fd closure
+    usleep(100000);
+
+    //Shutdown tudor driver (unloads DLL code)
     log_info("Shutting down tudor driver...");
-    if(!tudor_shutdown()) {
-        log_error("Error shutting down tudor driver!");
-        return EXIT_FAILURE;
-    }
+    tudor_shutdown();
     free_pair_data();
 
-    //Close the USB device
-    libusb_poll_thread_exit = true;
-    libusb_close(usb_dev);
-
-    //Shutdown libusb
-    cant_fail_ret(pthread_join(usb_poll_thread, NULL));
-    libusb_exit(usb_ctx);
-
-    return EXIT_SUCCESS;
+    //Use _exit to terminate immediately — DLL background threads may still be
+    //running and would crash if they try to execute unmapped code after return.
+    //All data is already saved, so this is safe.
+    log_info("Done.");
+    _exit(EXIT_SUCCESS);
 }

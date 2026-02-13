@@ -34,6 +34,15 @@ libtudor_src = [
     'src/winapi/suspend.c',
     'src/winapi/io.c',
     'src/winapi/system.c',
+    'src/winapi/hiddll.c',
+    'src/winapi/setupapi.c',
+    'src/winapi/user32.c',
+    'src/winapi/wtsapi.c',
+    'src/winapi/power.c',
+    'src/winapi/fileops.c',
+    'src/winapi/console.c',
+    'src/winapi/security.c',
+    'src/winapi/rpcrt4.c',
 
     'src/winapi/crypt/rsa_aes.c',
     'src/winapi/crypt/evp_digest.c',
@@ -55,7 +64,7 @@ libtudor_src = [
     'src/winapi/wdf/evtqueue.c',
     'src/winapi/wdf/queue.c',
     'src/winapi/wdf/reg.c',
-    'src/winapi/wdf/usb.c',
+    'src/winapi/wdf/hid.c',
 
     'src/tudor/async.c',
     'src/tudor/driver.c',
@@ -64,23 +73,23 @@ libtudor_src = [
     'src/tudor/reg.c'
 ]
 
-driver_dll_names = [
-    'synaFpAdapter104.dll',
-    'synaWudfBioUsb104.dll'
-]
+driver_dll_dir = meson.current_source_dir() / 'dlls'
+driver_dll_build_dir = meson.current_build_dir()
 
 add_global_arguments('-Wno-incompatible-pointer-types', language : 'c')
 
-driver_dlls = custom_target('driver-download', 
-    output: driver_dll_names,
-    input: ['download_driver.sh', 'installer.sha'],
-    command: [find_program('bash'), '@INPUT0@', '@INPUT1@', '@PRIVATE_DIR@', '@OUTDIR@'] + driver_dll_names
-)
-
-driver_dll_blobs = generator(find_program('ld'),
-    output: '@BASENAME@.o',
-    arguments: ['-r', '-b', 'binary', '-o', '@OUTPUT@', '@INPUT@']
-).process([driver_dlls])
+# Build DLL blobs with stable symbol names by cd-ing into the dlls directory
+# so ld sees just the filename, producing _binary_synaFpAdapter153_dll_{start,end,size}
+driver_dll_blobs = []
+foreach dll_name : ['synaFpAdapter153.dll', 'synaWudfBioHid153.dll']
+    dll_base = dll_name.replace('.dll', '')
+    driver_dll_blobs += custom_target('blob_' + dll_base,
+        output: dll_base + '.o',
+        command: ['sh', '-c', 'cd @0@ && ld -r -b binary -o @1@/@2@.o @3@'.format(
+            driver_dll_dir, driver_dll_build_dir, dll_base, dll_name)],
+        depend_files: files('dlls' / dll_name),
+    )
+endforeach
 
 libtudor_flags = []
 
@@ -94,12 +103,11 @@ endif
 
 thread_dep = dependency('threads')
 libcrypto_dep = dependency('libcrypto', version: '>=3.0.0')
-libusb_dep = dependency('libusb-1.0')
 
 libtudor_inc = include_directories('inc')
 
 libtudor = shared_library('tudor', [libtudor_src, driver_dll_blobs],
-    dependencies: [thread_dep, libcrypto_dep, libusb_dep],
+    dependencies: [thread_dep, libcrypto_dep],
     c_args: ['-D_GNU_SOURCE'] + libtudor_flags,
     link_args: ['-Wl,-z,noexecstack', '-Wl,--copy-dt-needed-entries'],
     include_directories: ['src', libtudor_inc],

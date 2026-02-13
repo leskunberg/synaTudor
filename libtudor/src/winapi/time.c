@@ -20,9 +20,13 @@ __winfnc BOOL QueryPerformanceCounter(uint64_t *counter) {
 }
 WINAPI(QueryPerformanceCounter)
 
+static int gettickcount_calls = 0;
 __winfnc DWORD GetTickCount() {
     uint64_t counter;
     if(!QueryPerformanceCounter(&counter)) { log_error("QueryPerformanceCounter failed!"); abort(); }
+    if(++gettickcount_calls <= 5 || (gettickcount_calls % 1000) == 0) {
+        log_debug("GetTickCount called (#%d) [ret=%p]", gettickcount_calls, __builtin_return_address(0));
+    }
     return (DWORD) counter;
 }
 WINAPI(GetTickCount)

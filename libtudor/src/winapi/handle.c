@@ -13,6 +13,7 @@ HANDLE winhandle_create(void *data, winhandle_destr_fnc *destr) {
 }
 
 void winhandle_destroy(HANDLE handle) {
+    if(!handle) return;
     if(handle->destr) handle->destr(handle->data);
     free(handle);
 }
@@ -32,6 +33,7 @@ __winfnc HANDLE GetStdHandle(DWORD type) {
 WINAPI(GetStdHandle)
 
 __winfnc BOOL CloseHandle(HANDLE handle) {
+    log_debug("CloseHandle called (handle=%p) [ret=%p]", handle, __builtin_return_address(0));
     winhandle_destroy(handle);
     return TRUE;
 }

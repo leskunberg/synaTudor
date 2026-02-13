@@ -191,3 +191,24 @@ __winfnc LONG RegSetValueExW(HANDLE hkey, const char16_t *val_name, DWORD resv, 
     return suc ? ERROR_SUCCESS : WINERR_SET_CODE;
 }
 WINAPI(RegSetValueExW)
+
+#define ERROR_NO_MORE_ITEMS 259L
+
+__winfnc LONG RegEnumKeyExW(HANDLE hkey, DWORD index, char16_t *name, DWORD *name_len, DWORD *resv, char16_t *class, DWORD *class_len, void *last_write_time) {
+    log_debug("RegEnumKeyExW called (key='%s', index=%u)", key_name(hkey), index);
+    return ERROR_NO_MORE_ITEMS;
+}
+WINAPI(RegEnumKeyExW)
+
+__winfnc LONG RegQueryInfoKeyW(HANDLE hkey, char16_t *class, DWORD *class_len, DWORD *resv, DWORD *num_subkeys, DWORD *max_subkey_len, DWORD *max_class_len, DWORD *num_values, DWORD *max_value_name_len, DWORD *max_value_len, DWORD *security_desc, void *last_write_time) {
+    log_debug("RegQueryInfoKeyW called (key='%s')", key_name(hkey));
+    if(num_subkeys) *num_subkeys = 0;
+    if(max_subkey_len) *max_subkey_len = 0;
+    if(max_class_len) *max_class_len = 0;
+    if(num_values) *num_values = 0;
+    if(max_value_name_len) *max_value_name_len = 0;
+    if(max_value_len) *max_value_len = 0;
+    if(security_desc) *security_desc = 0;
+    return ERROR_SUCCESS;
+}
+WINAPI(RegQueryInfoKeyW)

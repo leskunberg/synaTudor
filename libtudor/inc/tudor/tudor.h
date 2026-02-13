@@ -2,7 +2,9 @@
 #define LIBTUDOR_TUDOR_TUDOR_H
 
 #include <stdbool.h>
-#include <libusb.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <pthread.h>
 
 typedef struct _HANDLE *HANDLE;
 
@@ -72,6 +74,7 @@ struct tudor_device {
     struct tudor_device_state state;
 
     //Driver data
+    int hidraw_fd;
     HANDLE reg_key;
     struct winwdf_device *wdf_device;
     struct winwdf_file *wdf_file;
@@ -80,8 +83,12 @@ struct tudor_device {
     WINBIO_PIPELINE *pipeline;
     HANDLE winbio_file;
 
+    //Storage adapter
+    bool use_dll_storage; //True if using DLL's storage adapter instead of stub
+
     //Enroll data
     bool enrolling;
+    bool override_template_count; //Only override during enrollment to prevent DATABASE_FULL
     RECGUID enroll_guid;
     enum tudor_finger enroll_finger;
 
@@ -91,8 +98,9 @@ struct tudor_device {
     struct tudor_record *result_records_head, *result_records_cursor;
 };
 
-bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, struct tudor_device_state *state);
+bool tudor_open(struct tudor_device *device, int hidraw_fd, struct tudor_device_state *state);
 bool tudor_close(struct tudor_device *device);
+bool tudor_reopen(struct tudor_device *device);
 
 int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger);
 bool tudor_add_record(struct tudor_device *device, RECGUID guid, enum tudor_finger finger, const void *data, size_t data_size);
@@ -101,6 +109,9 @@ bool tudor_enroll_start(struct tudor_device *device, RECGUID guid, enum tudor_fi
 bool tudor_enroll_capture(struct tudor_device *device, bool *done, tudor_async_res_t *res);
 bool tudor_enroll_commit(struct tudor_device *device, bool *is_duplicate);
 bool tudor_enroll_discard(struct tudor_device *device);
+
+typedef void tudor_record_cb_fnc(RECGUID guid, enum tudor_finger finger, void *ctx);
+int tudor_enumerate_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger, tudor_record_cb_fnc *cb, void *ctx);
 
 bool tudor_verify(struct tudor_device *device, RECGUID guid, enum tudor_finger finger, bool *retry, bool *matches, tudor_async_res_t *res);
 bool tudor_identify(struct tudor_device *device, bool *retry, bool *found_match, RECGUID *guid, enum tudor_finger *finger, tudor_async_res_t *res);

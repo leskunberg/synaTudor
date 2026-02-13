@@ -40,6 +40,19 @@ static NTSTATUS tudor_devctrl(struct tudor_device *device, OVERLAPPED *ovlp, ULO
     NTSTATUS status = winwdf_devctrl_file(device->wdf_file, code, in_buf, in_size, out_buf, out_size, req);
     winmodule_set_cur(mod);
 
+    //Override template count to prevent DATABASE_FULL during enrollment only.
+    //During init/reopen, the DLL needs the real count to trigger DB_INIT (0xA5 01),
+    //which loads biometric templates into the matching engine.
+    if(code == 0x44202c && status == STATUS_SUCCESS && out_size >= 4) {
+        uint32_t val = *(uint32_t *)out_buf;
+        if(val > 0 && device->override_template_count) {
+            log_info("tudor_devctrl: IOCTL 0x44202c reported %u templates, overriding to 0 (enrollment mode)", val);
+            *(uint32_t *)out_buf = 0;
+        } else if(val > 0) {
+            log_info("tudor_devctrl: IOCTL 0x44202c reported %u templates (not overriding)", val);
+        }
+    }
+
     //Add callback
     if(status == STATUS_SUCCESS) winwdf_add_request_callback(*req, (winwdf_request_cb_fnc*) req_cb, ovlp);
 
@@ -55,45 +68,62 @@ static void tudor_cleanup(struct tudor_device *device, OVERLAPPED *ovlp, struct 
     winwdf_destroy_object((WDFOBJECT) req);
 }
 
-bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, struct tudor_device_state *state) {
+bool tudor_open(struct tudor_device *device, int hidraw_fd, struct tudor_device_state *state) {
     HRESULT hres;
     NTSTATUS status;
 
+    log_info("tudor_open: ENTER (hidraw_fd=%d, state=%p)", hidraw_fd, state);
+
+    device->hidraw_fd = hidraw_fd;
     device->state = state ? *state : (struct tudor_device_state) {0};
     device->enrolling = false;
+    device->override_template_count = false;
     cant_fail_ret(pthread_mutex_init(&device->records_lock, NULL));
     device->records_head = NULL;
     device->result_records_head = device->result_records_cursor = NULL;
 
-    //Reset the USB device
-    int usb_err;
-    if((usb_err = libusb_reset_device(usb_dev)) != 0) {
-        log_error("libusb_reset_device failed: %d [%s]", usb_err, libusb_error_name(usb_err));
-        return false;
-    }
-
     //Open the device through the driver
+    log_info("tudor_open: opening registry key...");
     device->reg_key = winreg_open_key(device, "HKEY_LOCAL_MACHINE\\Tudor\\Device");
-    if((status = winwdf_add_device(tudor_wdf_driver, device->reg_key, usb_dev, &device->wdf_device)) != 0) {
+    log_info("tudor_open: calling winwdf_add_device...");
+    if((status = winwdf_add_device(tudor_wdf_driver, device->reg_key, hidraw_fd, &device->wdf_device)) != 0) {
         log_error("Error adding WDF device: 0x%x!", status);
         return false;
     }
+    log_info("tudor_open: winwdf_add_device returned OK (wdf_device=%p)", device->wdf_device);
     if(!device->wdf_device) {
         log_error("Driver didn't create a WDF device!");
         return false;
     }
+    log_info("tudor_open: calling winwdf_event_queue_flush (this runs PnP callbacks)...");
     winwdf_event_queue_flush();
+    log_info("tudor_open: winwdf_event_queue_flush returned");
 
+    log_info("tudor_open: calling winwdf_open_device...");
     if((status = winwdf_open_device(device->wdf_device, &device->wdf_file)) != 0) {
         log_error("Error opening WDF file: 0x%x!", status);
         return false;
     }
+    log_info("tudor_open: winwdf_open_device returned OK");
 
     //This is dumb, but otherwise we run into race conditions
+    log_info("tudor_open: sleeping 3 seconds for race condition workaround...");
     cant_fail(usleep(3000000));
+    log_info("tudor_open: sleep done");
 
     //Initialize the pipeline
     winmodule_set_cur(&tudor_adapter_dll->module);
+
+    //Use the DLL's storage adapter if available — it loads templates from the sensor
+    //and triggers the engine's matcher initialization (0xA2/0xA5 commands).
+    //Fall back to our stub storage if the DLL's adapter isn't available.
+    WINBIO_STORAGE_INTERFACE *storage = tudor_dll_storage_adapter ? tudor_dll_storage_adapter : tudor_storage_adapter;
+    device->use_dll_storage = (storage == tudor_dll_storage_adapter);
+    if(device->use_dll_storage) {
+        log_info("Using DLL storage adapter for pipeline (sensor-side template management)");
+    } else {
+        log_info("Using stub storage adapter for pipeline");
+    }
 
     log_debug("Initializing WINBIO pipeline...");
     device->pipeline = (WINBIO_PIPELINE*) malloc(sizeof(WINBIO_PIPELINE));
@@ -101,21 +131,29 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
     *device->pipeline = (WINBIO_PIPELINE) {0};
     device->pipeline->EngineInterface = tudor_engine_adapter;
     device->pipeline->SensorInterface = tudor_sensor_adapter;
-    device->pipeline->StorageInterface = tudor_storage_adapter;
+    device->pipeline->StorageInterface = storage;
     device->pipeline->SensorHandle = device->winbio_file = winio_create_file(device, true, NULL, NULL, (winio_devctrl_fnc*) tudor_devctrl, (winio_cancel_fnc*) tudor_cancel, (winio_cleanup_fnc*) tudor_cleanup, NULL);
     device->pipeline->EngineHandle = INVALID_HANDLE_VALUE;
     device->pipeline->StorageHandle = INVALID_HANDLE_VALUE;
-    device->pipeline->StorageContext = device;
+    device->pipeline->StorageContext = device->use_dll_storage ? NULL : device;
 
     log_debug("Attaching interfaces to pipeline...");
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Attach, device->pipeline);
     WINBIO_CALL_PIPELINE(tudor_engine_adapter->Attach, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->Attach, device->pipeline);
+    WINBIO_CALL_PIPELINE(storage->Attach, device->pipeline);
 
     log_debug("Initializing pipeline interfaces...");
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->PipelineInit, device->pipeline);
     WINBIO_CALL_PIPELINE(tudor_engine_adapter->PipelineInit, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->PipelineInit, device->pipeline);
+    WINBIO_CALL_PIPELINE(storage->PipelineInit, device->pipeline);
+
+    //Open the database — this loads templates from the sensor into the storage adapter
+    if(device->use_dll_storage && storage->OpenDatabase) {
+        GUID db_id = DEFINE_GUID(d6612bd6, ecc0, 40bf, 80ff, 7e480722ad8c);
+        static const char16_t empty[] = u"";
+        log_debug("Opening storage database...");
+        WINBIO_CALL_PIPELINE(storage->OpenDatabase, device->pipeline, &db_id, empty, empty);
+    }
 
     //Reset the sensor
     log_debug("Resetting sensor...");
@@ -125,14 +163,14 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
     log_debug("Activating pipeline...");
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Activate, device->pipeline);
     WINBIO_CALL_PIPELINE(tudor_engine_adapter->Activate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->Activate, device->pipeline);
+    WINBIO_CALL_PIPELINE(storage->Activate, device->pipeline);
 
     //Check the sensor status
     log_debug("Checking sensor status...");
     ULONG sensor_status = WINBIO_SENSOR_FAILURE;
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->QueryStatus, device->pipeline, &sensor_status)
     if(sensor_status != WINBIO_SENSOR_READY) {
-        log_error("Sensor didn't return ready status! [status 0x%x]", status);
+        log_error("Sensor didn't return ready status! [sensor_status 0x%x]", sensor_status);
         return false;
     }
 
@@ -144,22 +182,30 @@ bool tudor_close(struct tudor_device *device) {
 
     winmodule_set_cur(&tudor_adapter_dll->module);
 
+    WINBIO_STORAGE_INTERFACE *storage = device->use_dll_storage ? tudor_dll_storage_adapter : tudor_storage_adapter;
+
     //Deactivate the pipeline
     log_debug("Deactivating pipeline...");
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Deactivate, device->pipeline);
     WINBIO_CALL_PIPELINE(tudor_engine_adapter->Deactivate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->Deactivate, device->pipeline);
+    WINBIO_CALL_PIPELINE(storage->Deactivate, device->pipeline);
+
+    //Close the database if using DLL storage
+    if(device->use_dll_storage && storage->CloseDatabase) {
+        log_debug("Closing storage database...");
+        WINBIO_CALL_PIPELINE(storage->CloseDatabase, device->pipeline);
+    }
 
     //Uninitialize the pipeline
     log_debug("Uninitializing pipeline interfaces...");
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->PipelineCleanup, device->pipeline);
     WINBIO_CALL_PIPELINE(tudor_engine_adapter->PipelineCleanup, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->PipelineCleanup, device->pipeline);
+    WINBIO_CALL_PIPELINE(storage->PipelineCleanup, device->pipeline);
 
     log_debug("Detaching interfaces from pipeline...");
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Detach, device->pipeline);
     WINBIO_CALL_PIPELINE(tudor_engine_adapter->Detach, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->Detach, device->pipeline);
+    WINBIO_CALL_PIPELINE(storage->Detach, device->pipeline);
     free(device->pipeline);
 
     winhandle_destroy(device->winbio_file);
@@ -187,6 +233,70 @@ bool tudor_close(struct tudor_device *device) {
     return true;
 }
 
+bool tudor_reopen(struct tudor_device *device) {
+    int fd = device->hidraw_fd;
+    log_info("tudor_reopen: closing and reopening device (fd=%d)...", fd);
+
+    if(!tudor_close(device)) {
+        log_error("tudor_reopen: close failed!");
+        return false;
+    }
+
+    if(!tudor_open(device, fd, NULL)) {
+        log_error("tudor_reopen: open failed!");
+        return false;
+    }
+
+    log_info("tudor_reopen: device reopened successfully");
+    return true;
+}
+
+int tudor_enumerate_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger, tudor_record_cb_fnc *cb, void *ctx) {
+    winmodule_set_cur(&tudor_adapter_dll->module);
+
+    WINBIO_STORAGE_INTERFACE *storage = device->pipeline->StorageInterface;
+    WINBIO_IDENTITY ident;
+    if(guid) {
+        ident.Type = WINBIO_ID_TYPE_GUID;
+        ident.TemplateGuid = *(GUID*)(void*)guid;
+    } else {
+        ident.Type = WINBIO_ID_TYPE_WILDCARD;
+        ident.Wildcard = 0x25066282; // WINBIO_IDENTITY_WILDCARD
+    }
+
+    log_debug("tudor_enumerate_records: QueryBySubject type=%d finger=%d", ident.Type, finger);
+    HRESULT hr = storage->QueryBySubject(device->pipeline, &ident, (UCHAR)finger);
+    if(hr != ERROR_SUCCESS) {
+        log_warn("tudor_enumerate_records: QueryBySubject failed: 0x%08x", hr);
+        return 0;
+    }
+
+    int count = 0;
+    hr = storage->FirstRecord(device->pipeline);
+    if(hr != ERROR_SUCCESS) {
+        log_warn("tudor_enumerate_records: FirstRecord failed: 0x%08x", hr);
+        return 0;
+    }
+    while(hr == ERROR_SUCCESS) {
+        WINBIO_STORAGE_RECORD srec = {0};
+        hr = storage->GetCurrentRecord(device->pipeline, &srec);
+        if(hr != ERROR_SUCCESS) {
+            log_warn("tudor_enumerate_records: GetCurrentRecord failed: 0x%08x", hr);
+            break;
+        }
+
+        if(!srec.Identity) {
+            log_warn("tudor_enumerate_records: GetCurrentRecord returned NULL Identity");
+            break;
+        }
+        if(cb) cb(*(RECGUID*)(void*)&srec.Identity->TemplateGuid, (enum tudor_finger)srec.SubFactor, ctx);
+        count++;
+
+        hr = storage->NextRecord(device->pipeline);
+    }
+    return count;
+}
+
 bool tudor_enroll_start(struct tudor_device *device, RECGUID guid, enum tudor_finger finger) {
     winmodule_set_cur(&tudor_adapter_dll->module);
     HRESULT hres;
@@ -195,6 +305,11 @@ bool tudor_enroll_start(struct tudor_device *device, RECGUID guid, enum tudor_fi
         log_error("Already enrolling a finger!");
         return false;
     }
+
+    //Don't erase sensor templates - old templates with persisted identity data
+    //are needed for the DLL's background thread to call DB_INIT (0xA5 01),
+    //which loads biometric templates into the matching engine.
+    //The template count override in tudor_devctrl handles DATABASE_FULL.
 
     //Follow https://docs.microsoft.com/en-us/windows/win32/secbiomet/adapter-workflow - WinBioEnrollBegin
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->ClearContext, device->pipeline);
@@ -207,6 +322,7 @@ bool tudor_enroll_start(struct tudor_device *device, RECGUID guid, enum tudor_fi
     });
 
     device->enrolling = true;
+    device->override_template_count = true;
     device->enroll_guid = guid;
     device->enroll_finger = finger;
     return true;
@@ -299,12 +415,13 @@ bool tudor_enroll_commit(struct tudor_device *device, bool *is_duplicate) {
         .Type = WINBIO_ID_TYPE_GUID,
         .TemplateGuid = *(GUID*) &device->enroll_guid
     }, (UCHAR) device->enroll_finger, NULL, 0)) != ERROR_SUCCESS) {
-        log_error("Error commiting enrollment: 0x%x!", hres);
+        log_error("Error committing enrollment: 0x%x!", hres);
         if(hres == WINBIO_E_DUPLICATE_ENROLLMENT) *is_duplicate = true;
         return false;
     }
 
     device->enrolling = false;
+    device->override_template_count = false;
     return true;
 }
 
@@ -325,6 +442,7 @@ bool tudor_enroll_discard(struct tudor_device *device) {
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->ClearContext, device->pipeline);
 
     device->enrolling = false;
+    device->override_template_count = false;
     return true;
 }
 

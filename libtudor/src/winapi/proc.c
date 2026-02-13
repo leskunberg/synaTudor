@@ -320,6 +320,76 @@ __winfnc LONG UnhandledExceptionFilter(void *excep_pointers) {
 WINAPI(UnhandledExceptionFilter)
 
 __winfnc void Sleep(DWORD num_ms) {
+    log_debug("Sleep called (%u ms)", num_ms);
     cant_fail(usleep((useconds_t) num_ms * 1000));
+    log_debug("Sleep returned");
 }
 WINAPI(Sleep)
+
+__winfnc void ExitProcess(UINT exit_code) {
+    log_error("ExitProcess called with exit code %u", exit_code);
+    exit(exit_code);
+}
+WINAPI(ExitProcess)
+
+__winfnc void *EncodePointer(void *ptr) {
+    return ptr;
+}
+WINAPI(EncodePointer)
+
+__winfnc void OutputDebugStringA(const char *str) {
+    log_debug("[OutputDebugStringA] %s", str ? str : "(null)");
+}
+WINAPI(OutputDebugStringA)
+
+__winfnc void RaiseException(DWORD code, DWORD flags, DWORD num_args, const ULONG_PTR *args) {
+    log_error("RaiseException called! code=0x%x flags=0x%x", code, flags);
+    abort();
+}
+WINAPI(RaiseException)
+
+__winfnc void *RtlPcToFileHeader(void *pc_value, void **base_of_image) {
+    if(base_of_image) *base_of_image = NULL;
+    return NULL;
+}
+WINAPI(RtlPcToFileHeader)
+
+__winfnc void RtlUnwind(void *target_frame, void *target_ip, void *exception_record, void *return_value) {
+    log_warn("RtlUnwind called - not implemented");
+}
+WINAPI(RtlUnwind)
+
+__winfnc void RtlUnwindEx(void *target_frame, void *target_ip, void *exception_record, void *return_value, void *context, void *history) {
+    log_warn("RtlUnwindEx called - not implemented");
+}
+WINAPI(RtlUnwindEx)
+
+__winfnc void *RtlVirtualUnwind(DWORD type, DWORD64 base, DWORD64 pc, void *entry, void *context, void **handler_data, DWORD64 *establisher_frame, void *context_pointers) {
+    if(establisher_frame) *establisher_frame = 0;
+    return NULL;
+}
+WINAPI(RtlVirtualUnwind)
+
+__winfnc BOOL SetStdHandle(DWORD std_handle, HANDLE handle) {
+    return TRUE;
+}
+WINAPI(SetStdHandle)
+
+__winfnc DWORD WTSGetActiveConsoleSessionId() {
+    return 1;
+}
+WINAPI(WTSGetActiveConsoleSessionId)
+
+__winfnc BOOL SetEnvironmentVariableW(const char16_t *name, const char16_t *value) {
+    log_debug("SetEnvironmentVariableW called");
+    return TRUE;
+}
+WINAPI(SetEnvironmentVariableW)
+
+/* MSVC C-language SEH handler. Called from PE exception dispatch.
+ * We don't support SEH on Linux - just return "continue search". */
+__winfnc int __C_specific_handler(void *ExceptionRecord, void *EstablisherFrame, void *ContextRecord, void *DispatcherContext) {
+    log_warn("__C_specific_handler called - SEH not supported");
+    return 1; /* ExceptionContinueSearch */
+}
+WINAPI(__C_specific_handler)

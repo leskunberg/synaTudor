@@ -200,3 +200,18 @@ __winfnc ULONG TraceMessage(HANDLE handle, ULONG flags, GUID *guid, USHORT num, 
     return ERROR_SUCCESS;
 }
 WINAPI(TraceMessage)
+
+__winfnc ULONG GetTraceEnableLevel(HANDLE handle) {
+    return 0;
+}
+WINAPI(GetTraceEnableLevel)
+
+__winfnc ULONG GetTraceEnableFlags(HANDLE handle) {
+    return 0;
+}
+WINAPI(GetTraceEnableFlags)
+
+__winfnc HANDLE GetTraceLoggerHandle(void *buffer) {
+    return (HANDLE)(uintptr_t)0;
+}
+WINAPI(GetTraceLoggerHandle)
