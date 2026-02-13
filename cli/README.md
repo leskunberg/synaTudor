@@ -8,8 +8,8 @@ could take over your local user account! This CLI is only intended to be used
 for debugging and/or small scale tests.
 
 ## Usage
-Start the wrapper using `sudo ../out/tudor_cli <path to data store file> <flags>`. The
-data store file is a file where the drivers will store data like pairing data
+Start the wrapper using `sudo ./build/cli/tudor_cli <path to data store file> <flags>`.
+The data store file is a file where the driver will store data like pairing data
 and enrollment records, and has to be in a directory accessible by your own user
 (the wrapper drops privileges before opening the file for security reasons).
 
@@ -20,8 +20,12 @@ Flag | Description
 `-v` | Increase the verbosity of the log output
 `-q` | Decrease the verbosity of the log output
 `-t` | Enable display of driver debug trace messages
-`-V <vid>` | Set the sensor USB VID (default: 0x06cb)
-`-P <pid>` | Set the sensor USB PID (default: 0x00be)
+`-H <path>` | Set the hidraw command channel device path (e.g. `/dev/hidraw5`)
+`-I <path>` | Set the hidraw image channel device path (e.g. `/dev/hidraw2`)
+
+If `-H` and `-I` are not specified, the CLI auto-detects the correct hidraw
+devices by scanning `/sys/class/hidraw/` for the keyboard's VID:PID and
+identifying channels by their HID report descriptors.
 
 Once the program is running, after some time, a command prompt should appear.
 All available commands are displayed there.

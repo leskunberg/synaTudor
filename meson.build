@@ -7,7 +7,6 @@ INSTALL_DIR = '/sbin/tudor'
 
 subdir('libtudor')
 subdir('cli')
-# HID mode: disabled modules that need libusb rework
-#subdir('tudor-host')
-#subdir('tudor-host-launcher')
-#subdir('libfprint-tod')
+subdir('tudor-host')
+subdir('tudor-host-launcher')
+subdir('libfprint-tod')

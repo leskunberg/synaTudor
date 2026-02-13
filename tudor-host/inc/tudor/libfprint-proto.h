@@ -43,7 +43,8 @@ struct ipc_msg_init {
     enum ipc_msg_type type;
 
     enum log_level log_level;
-    uint8_t usb_bus, usb_addr;
+    bool has_image_channel;
+    // fd(s) via SCM_RIGHTS ancillary data: [0]=cmd, [1]=img (if has_image_channel)
 };
 
 struct ipc_msg_resp_probe {

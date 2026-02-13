@@ -1,8 +1,7 @@
 tudor_cli_src = [
     'src/main.c',
     'src/cli.c',
-    'src/datastore.c',
-    'src/hidraw_detect.c'
+    'src/datastore.c'
 ]
 
 thread_dep = dependency('threads')

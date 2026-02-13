@@ -1,7 +1,10 @@
 [Unit]
 Description=Tudor host launcher DBus service
+After=bluetooth.target
 
 [Service]
+Restart=on-failure
+RestartSec=3
 Type=dbus
 BusName=net.reactivated.TudorHostLauncher
 ExecStart=/sbin/tudor/tudor_host_launcher

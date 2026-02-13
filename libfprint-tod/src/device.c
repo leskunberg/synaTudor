@@ -13,8 +13,10 @@ GType fpi_tod_shared_driver_get_type() {
 }
 
 static FpIdEntry tudor_ids[] = {
-    { .vid = 0x06cb, .pid = 0x00be },
-//  { .vid = 0x06cb, .pid = 0x00bd }, //TODO Check if it's also supported
+    { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_HIDRAW,
+      .hid_id = { .vid = 0x17ef, .pid = 0x613e } },  /* BT keyboard */
+    { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_HIDRAW,
+      .hid_id = { .vid = 0x17ef, .pid = 0x6142 } },  /* USB keyboard */
     { 0 }
 };
 
@@ -47,7 +49,9 @@ static void ensure_closed(FpiDeviceTudor *tdev) {
 static GList *dev_list = 0;
 
 static void fpi_device_tudor_init(FpiDeviceTudor *tdev) {
-    tdev->usb_fd = -1;
+    tdev->cmd_fd = -1;
+    tdev->img_fd = -1;
+    tdev->hidraw_path = NULL;
     tdev->host_has_id = false;
     tdev->host_sleep_inhib = -1;
     tdev->ipc_socket = NULL;
@@ -89,8 +93,12 @@ static void fpi_device_tudor_finalize(GObject *obj) {
     ipc_msg_buf_free(tdev->send_msg);
     g_ptr_array_unref(tdev->db_records);
 
-    //Free USB FD
-    if(tdev->usb_fd >= 0) g_assert_no_errno(close(tdev->usb_fd));
+    //Close hidraw fds
+    if(tdev->cmd_fd >= 0) g_assert_no_errno(close(tdev->cmd_fd));
+    if(tdev->img_fd >= 0) g_assert_no_errno(close(tdev->img_fd));
+
+    //Free hidraw path
+    g_clear_pointer(&tdev->hidraw_path, g_free);
 
     //Chain to parent
     G_OBJECT_CLASS(fpi_device_tudor_parent_class)->finalize(obj);
@@ -160,7 +168,7 @@ static void fpi_device_tudor_class_init(FpiDeviceTudorClass *class) {
     FpDeviceClass *dev_class = FP_DEVICE_CLASS(class);
     dev_class->id = "syna_tudor_relink";
     dev_class->full_name = "Synaptics Tudor";
-    dev_class->type = FP_DEVICE_TYPE_USB;
+    dev_class->type = FP_DEVICE_TYPE_UDEV;
     dev_class->id_table = tudor_ids;
     dev_class->nr_enroll_stages = TUDOR_NUM_ENROLL_STAGES;
     dev_class->scan_type = FP_SCAN_TYPE_PRESS;

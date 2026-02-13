@@ -8,12 +8,14 @@
 IPCMessageBuf *ipc_msg_buf_new() {
     IPCMessageBuf *msg = g_new(IPCMessageBuf, 1);
     msg->transfer_fd = -1;
+    msg->transfer_fd2 = -1;
     return msg;
 }
 
 void ipc_msg_buf_free(gpointer ptr) {
     IPCMessageBuf *msg = (IPCMessageBuf*) ptr;
     if(msg->transfer_fd >= 0) close(msg->transfer_fd);
+    if(msg->transfer_fd2 >= 0) close(msg->transfer_fd2);
     g_free(msg);
 }
 
@@ -54,7 +56,7 @@ static gboolean sock_ready(GSocket *sock, GIOCondition cond, gpointer user_data)
         return G_SOURCE_REMOVE;
     }
 
-    //Get the transfer FD
+    //Get the transfer FD(s)
     GError *fd_error = NULL;
     if(num_cmsgs > 0) {
         for(int i = 0; i < num_cmsgs; i++) {
@@ -62,11 +64,15 @@ static gboolean sock_ready(GSocket *sock, GIOCondition cond, gpointer user_data)
             if(!fd_error && G_IS_UNIX_FD_MESSAGE(cmsg)) {
                 GUnixFDMessage *fdmsg = G_UNIX_FD_MESSAGE(cmsg);
 
-                //Get the FD
+                //Get the FD(s)
                 GUnixFDList *fds = g_unix_fd_message_get_fd_list(fdmsg);
                 if(g_unix_fd_list_get_length(fds) >= 1) {
                     msg->transfer_fd = g_unix_fd_list_get(fds, 0, &error);
                     if(msg->transfer_fd < 0) fd_error = error;
+                }
+                if(!fd_error && g_unix_fd_list_get_length(fds) >= 2) {
+                    msg->transfer_fd2 = g_unix_fd_list_get(fds, 1, &error);
+                    if(msg->transfer_fd2 < 0) fd_error = error;
                 }
             }
             g_object_unref(cmsg);
@@ -151,6 +157,16 @@ bool send_ipc_msg(FpiDeviceTudor *tdev, IPCMessageBuf *msg, GError **error) {
             return false;
         }
 
+        //Also send second fd if present
+        if(msg->transfer_fd2 >= 0) {
+            int fd2 = msg->transfer_fd2;
+            msg->transfer_fd2 = -1;
+            if(!g_unix_fd_message_append_fd(fdmsg, fd2, error)) {
+                g_object_unref(fdmsg);
+                return false;
+            }
+        }
+
         cmsgs[0] = G_SOCKET_CONTROL_MESSAGE(fdmsg);
         num_cmsgs = 1;
     }
@@ -229,14 +245,14 @@ bool open_dbus_con(FpiDeviceTudor *tdev, GError **error) {
     return true;
 }
 
-bool start_host_process(FpiDeviceTudor *tdev, guint8 usb_bus, guint8 usb_addr, int *sock_fd, GError **error) {
+bool start_host_process(FpiDeviceTudor *tdev, const gchar *hidraw_path, int *sock_fd, GError **error) {
     g_assert_false(tdev->host_has_id);
 
     //Request the host launcher service to launch a host process
     GUnixFDList *fds;
     GVariant *rets = g_dbus_connection_call_with_unix_fd_list_sync(tdev->dbus_con,
         TUDOR_HOST_LAUNCHER_SERVICE, TUDOR_HOST_LAUNCHER_OBJ, TUDOR_HOST_LAUNCHER_INTERF,
-        TUDOR_HOST_LAUNCHER_LAUNCH_METHOD, g_variant_new("((yy))", usb_bus, usb_addr), G_VARIANT_TYPE("(uh)"), G_DBUS_CALL_FLAGS_NONE,
+        TUDOR_HOST_LAUNCHER_LAUNCH_METHOD, g_variant_new("(s)", hidraw_path), G_VARIANT_TYPE("(uh)"), G_DBUS_CALL_FLAGS_NONE,
         G_MAXINT,
         NULL, &fds,
         NULL, error
@@ -274,14 +290,14 @@ bool kill_host_process(FpiDeviceTudor *tdev, GError **error) {
     return true;
 }
 
-bool adopt_host_process(FpiDeviceTudor *tdev, guint8 usb_bus, guint8 usb_addr, int *sock_fd, GError **error) {
+bool adopt_host_process(FpiDeviceTudor *tdev, const gchar *hidraw_path, int *sock_fd, GError **error) {
     g_assert_false(tdev->host_has_id);
 
     //Request the host launcher service to adopt a host process
     GUnixFDList *fds;
     GVariant *rets = g_dbus_connection_call_with_unix_fd_list_sync(tdev->dbus_con,
         TUDOR_HOST_LAUNCHER_SERVICE, TUDOR_HOST_LAUNCHER_OBJ, TUDOR_HOST_LAUNCHER_INTERF,
-        TUDOR_HOST_LAUNCHER_ADOPT_METHOD, g_variant_new("((yy))", usb_bus, usb_addr), G_VARIANT_TYPE("(uh)"), G_DBUS_CALL_FLAGS_NONE,
+        TUDOR_HOST_LAUNCHER_ADOPT_METHOD, g_variant_new("(s)", hidraw_path), G_VARIANT_TYPE("(uh)"), G_DBUS_CALL_FLAGS_NONE,
         G_MAXINT,
         NULL, &fds,
         NULL, error

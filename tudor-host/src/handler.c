@@ -31,7 +31,7 @@ struct handler_state {
 };
 
 static inline void consume_simple_msg(int ipc_sock, enum ipc_msg_type type) {
-    ipc_recv_msg(ipc_sock, &type, type, sizeof(type), sizeof(type), NULL);
+    ipc_recv_msg(ipc_sock, &type, type, sizeof(type), sizeof(type), NULL, NULL);
 }
 
 static inline void send_ack(int ipc_sock) {
@@ -292,7 +292,7 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
             //Receive the message
             struct ipc_msg_add_record *msg = (struct ipc_msg_add_record*) malloc(sizeof(struct ipc_msg_add_record) + IPC_MAX_RECORD_SIZE);
             if(!msg) { perror("Couldn't allocate ADD_RECORD IPC message buffer"); abort(); }
-            size_t rec_size = ipc_recv_msg(state->ipc_sock, msg, type, sizeof(struct ipc_msg_add_record), sizeof(struct ipc_msg_add_record) + IPC_MAX_RECORD_SIZE, NULL) - sizeof(struct ipc_msg_add_record);
+            size_t rec_size = ipc_recv_msg(state->ipc_sock, msg, type, sizeof(struct ipc_msg_add_record), sizeof(struct ipc_msg_add_record) + IPC_MAX_RECORD_SIZE, NULL, NULL) - sizeof(struct ipc_msg_add_record);
 
             //Add the record
             if(!tudor_add_record(state->dev, msg->guid, msg->finger, msg->record_data, rec_size)) {
@@ -317,7 +317,7 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
 
             //Receive the message
             struct ipc_msg_del_record msg;
-            ipc_recv_msg(state->ipc_sock, &msg, type, sizeof(msg), sizeof(msg), NULL);
+            ipc_recv_msg(state->ipc_sock, &msg, type, sizeof(msg), sizeof(msg), NULL, NULL);
 
             //Delete the record
             int num_recs = tudor_wipe_records(state->dev, &msg.guid, msg.finger);
@@ -344,7 +344,7 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
             
             //Receive the message
             struct ipc_msg_enroll msg;
-            ipc_recv_msg(state->ipc_sock, &msg, type, sizeof(msg), sizeof(msg), NULL);
+            ipc_recv_msg(state->ipc_sock, &msg, type, sizeof(msg), sizeof(msg), NULL, NULL);
 
             //Initialize state
             init_action(state);
@@ -374,7 +374,7 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
 
             //Receive the message
             struct ipc_msg_verify msg;
-            ipc_recv_msg(state->ipc_sock, &msg, type, sizeof(msg), sizeof(msg), NULL);
+            ipc_recv_msg(state->ipc_sock, &msg, type, sizeof(msg), sizeof(msg), NULL, NULL);
 
             //Initialize state
             init_action(state);

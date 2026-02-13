@@ -70,7 +70,8 @@ libtudor_src = [
     'src/tudor/driver.c',
     'src/tudor/device.c',
     'src/tudor/storage.c',
-    'src/tudor/reg.c'
+    'src/tudor/reg.c',
+    'src/tudor/hidraw_detect.c'
 ]
 
 driver_dll_dir = meson.current_source_dir() / 'dlls'

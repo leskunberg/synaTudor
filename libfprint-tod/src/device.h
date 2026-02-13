@@ -13,7 +13,9 @@ struct _FpiDeviceTudor {
     GList *dev_list_link;
 
     GDBusConnection *dbus_con;
-    gint usb_fd;
+    gint cmd_fd;
+    gint img_fd;
+    gchar *hidraw_path;
 
     guint host_id;
     bool host_has_id, host_dead;

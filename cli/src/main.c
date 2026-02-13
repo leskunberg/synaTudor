@@ -15,7 +15,7 @@
 #include <tudor/tudor.h>
 #include "datastore.h"
 #include "cli.h"
-#include "hidraw_detect.h"
+#include <tudor/hidraw_detect.h>
 
 /* From fileops.c — image channel fd and shutdown flag */
 extern int win_hidraw_fd_img;

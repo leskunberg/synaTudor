@@ -26,7 +26,7 @@ enum ipc_msg_type ipc_peek_msg(int sock) {
     return msg_type;
 }
 
-size_t ipc_recv_msg(int sock, void *buf, enum ipc_msg_type type, size_t min_sz, size_t max_sz, int *fd) {
+size_t ipc_recv_msg(int sock, void *buf, enum ipc_msg_type type, size_t min_sz, size_t max_sz, int *fd, int *fd2) {
     struct iovec iov = {
         .iov_base = buf,
         .iov_len = max_sz
@@ -34,11 +34,12 @@ size_t ipc_recv_msg(int sock, void *buf, enum ipc_msg_type type, size_t min_sz, 
 
     struct {
         struct cmsghdr hdr;
-        int fd;
+        int fds[2];
     } cmsg = {
-        .hdr.cmsg_len = CMSG_LEN(sizeof(int)),
+        .hdr.cmsg_len = CMSG_LEN(sizeof(int) * 2),
         .hdr.cmsg_level = SOL_SOCKET,
-        .hdr.cmsg_type = SCM_RIGHTS
+        .hdr.cmsg_type = SCM_RIGHTS,
+        .fds = { -1, -1 }
     };
 
     struct msghdr msg_hdr = {
@@ -63,16 +64,29 @@ size_t ipc_recv_msg(int sock, void *buf, enum ipc_msg_type type, size_t min_sz, 
         abort();
     }
 
-    //Transfer FD
+    //Transfer FD(s)
     if(msg_hdr.msg_controllen > 0) {
-        if(msg_hdr.msg_controllen != sizeof(cmsg) || cmsg.hdr.cmsg_len != CMSG_LEN(sizeof(int)) || cmsg.hdr.cmsg_level != SOL_SOCKET || cmsg.hdr.cmsg_type != SCM_RIGHTS) {
+        if(cmsg.hdr.cmsg_level != SOL_SOCKET || cmsg.hdr.cmsg_type != SCM_RIGHTS) {
             log_error("Invalid IPC control message");
             abort();
         }
 
-        if(fd) *fd = cmsg.fd;
-        else cant_fail(close(cmsg.fd));
-    } else if(fd) *fd = -1;
+        //Determine how many fds were received
+        size_t fd_bytes = cmsg.hdr.cmsg_len - CMSG_LEN(0);
+        int num_fds = (int)(fd_bytes / sizeof(int));
+
+        if(num_fds >= 1) {
+            if(fd) *fd = cmsg.fds[0];
+            else cant_fail(close(cmsg.fds[0]));
+        }
+        if(num_fds >= 2) {
+            if(fd2) *fd2 = cmsg.fds[1];
+            else cant_fail(close(cmsg.fds[1]));
+        }
+    } else {
+        if(fd) *fd = -1;
+        if(fd2) *fd2 = -1;
+    }
 
     return msg_size;
 }

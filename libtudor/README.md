@@ -3,6 +3,10 @@ This folder contains the common library which relinks and interfaces with the
 native Windows driver. It is used by the [CLI wrapper](../cli/README.md) and the
 [libfprint host](../tudor-host/README.md).
 
+It also provides hidraw device detection (`tudor/hidraw_detect.h`), which
+identifies the fingerprint sensor's command and image channels by scanning
+sysfs and parsing HID report descriptors.
+
 ## Driver Download / Extraction
 During your first build, the Windows driver will automatically be downloaded and
 extracted (you'll need a working internet connection). This requires

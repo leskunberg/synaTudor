@@ -12,45 +12,84 @@ AS PART OF THIS PROJECT, INCLUDING, BUT NOT LIMITED TO, BRICKED SENSORS,
 CORRUPTED FIRMWARE, BYPASSES OF HOST SECURITY, AND VULNERABILITIES IN THE CODE.
 USE AT YOUR OWN RISK.
 
-**NOTE: The project should be fully functional right now, contrary to its earlier state. If there are any issues, please report them.**
+## Supported Hardware
+Currently targets the Synaptics Tudor fingerprint sensor (06CB:00DD) embedded in
+the Lenovo X1 Fold 16 keyboard (VID:PID 17EF:613E over Bluetooth, 17EF:6142
+over USB). The sensor communicates via HID over hidraw.
+
+**USB mode is required** — the sensor needs both a command channel and an image
+channel (separate HID interfaces), and the image channel is only available over
+USB. Bluetooth mode exposes only a single hidraw device without the image
+channel, which is insufficient for fingerprint capture.
 
 ## Structure
 This project is split over multiple folders, all providing different parts of
 the functionality:
 - [libtudor](libtudor/README.md): Contains the common library code handling
-  relinking and interfacing with the driver.
+  relinking, interfacing with the driver, and hidraw device detection.
 - [cli](cli/README.md): Contains a simple CLI wrapper for the relinked driver.
-- [tudor-host](tudor-host/README.md): Contains the host application for
-  libtudor, used by the libfprint module.
+- [tudor-host](tudor-host/README.md): Contains the sandboxed host process for
+  libtudor, used by the libfprint module. Receives hidraw file descriptors over
+  IPC from the libfprint module.
 - [tudor-host-launcher](tudor-host-launcher/README.md): Contains the systemd
-  service which launches the tudor host processes. This extra step is needed to
-  bypass the strict fprintd sandboxing, which messes with the host's even
-  stricter sandboxing.
-- [libfprint-tod](libfprint-tod/README.md): Contains the libfprint module, to be
-  loaded by the libfprint TOD fork.
+  D-Bus service which launches and manages tudor host processes. This extra step
+  is needed to bypass the strict fprintd sandboxing, which interferes with the
+  host's own stricter sandboxing.
+- [libfprint-tod](libfprint-tod/README.md): Contains the libfprint TOD module,
+  which integrates with fprintd for system-level fingerprint authentication
+  (login, sudo, screen unlock).
 
 ## Building / Installation
 The same build system used by libfprint, meson, is used for this project.
 During the first build, the Windows driver is automatically downloaded and
 extracted. `innoextract` has to be installed for this.
-To build and install all contained parts, execute:
+
+### Dependencies
+- meson (>= 0.57.0)
+- innoextract (for driver extraction)
+- libcrypto (OpenSSL)
+- libcap
+- libseccomp
+- glib/gio (>= 2.0)
+- dbus-1
+- json-glib-1.0
+- libfprint-tod (for the fprintd integration module)
+
+### Build
 ```sh
-meson build
-cd build
-ninja
-sudo ninja install
+meson setup build
+ninja -C build
+sudo ninja -C build install
 ```
-(for Arch Linux specifically, you might want to use `arch-meson` instead of `meson`)
+(for Arch Linux specifically, you might want to use `arch-meson` instead of `meson setup`)
 
 For documentation about build options etc., see the individual parts.
 
 For the libfprint module to be picked up and work, you'll need to have a
 `libfprint-tod` fork of libfprint installed. Most Linux distributions have a
-seperate package which you can install instead of the regular libfprint one
+separate package which you can install instead of the regular libfprint one
 (e.g. Arch Linux: AUR `libfprint-tod-git`).
 
-~~**NOTE:** Currently libfprint-tod has a bug which can cause fprintd to lock up.
-It's recommended to use [this
-fork](https://gitlab.freedesktop.org/Popax21/libfprint/-/tree/tod) for now, at least
-until it's merged into the base repository.~~
-The regular upstream libfprint-tod repository should work now
+### Quick Start (CLI)
+The CLI can be used for standalone testing without fprintd:
+```sh
+sudo ./build/cli/tudor_cli /tmp/tudor_data -vv
+```
+This auto-detects the hidraw devices. To specify them manually:
+```sh
+sudo ./build/cli/tudor_cli /tmp/tudor_data -vv -H /dev/hidraw5 -I /dev/hidraw2
+```
+Where `-H` is the command channel and `-I` is the image channel.
+
+### Quick Start (fprintd)
+After installing, enable and start the host launcher service:
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now tudor-host-launcher
+```
+Then use fprintd as usual:
+```sh
+fprintd-list           # verify device is detected
+fprintd-enroll         # enroll a fingerprint
+fprintd-verify         # verify against enrolled fingerprint
+```

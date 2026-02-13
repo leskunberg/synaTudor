@@ -1,7 +1,7 @@
 #include <sys/socket.h>
-#include <libusb.h>
-#include <gusb.h>
+#include <fcntl.h>
 #include <tudor/dbus-launcher.h>
+#include <tudor/hidraw_detect.h>
 #include "open.h"
 #include "data.h"
 #include "ipc.h"
@@ -187,36 +187,32 @@ static void init_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_data
     g_object_unref(task);
 }
 
-static void init_host_proc(FpiDeviceTudor *tdev, GTask *task, GUsbDevice *usb_dev) {
+static void init_host_proc(FpiDeviceTudor *tdev, GTask *task) {
     GError *error = NULL;
 
-    //Open the USB device to get its FD
-    if(tdev->usb_fd < 0) {
-        if(!g_usb_device_open(usb_dev, &error)) {
+    //Open the hidraw command channel
+    if(tdev->cmd_fd < 0) {
+        tdev->cmd_fd = open(tdev->hidraw_path, O_RDWR | O_NONBLOCK);
+        if(tdev->cmd_fd < 0) {
+            error = g_error_new(G_IO_ERROR, g_io_error_from_errno(errno),
+                "Failed to open hidraw command channel %s: %s", tdev->hidraw_path, g_strerror(errno));
             dispose_dev(tdev);
             g_task_return_error(task, error);
             g_object_unref(task);
             return;
         }
+    }
 
-        //Get the USB device's private data 
-#if G_USB_CHECK_VERSION(0, 4, 0)
-        //0.4+ uses the glib private class data mechanism
-        void **dev_priv = (void**) g_type_instance_get_private(&usb_dev->parent_instance.g_type_instance, G_USB_TYPE_DEVICE);
-#else
-        void **dev_priv = usb_dev->priv;
-#endif
-
-        //Get the FD using cursed offset magic
-        libusb_device_handle *dev_handle = (libusb_device_handle*) (dev_priv[3]); //(GUsbDevicePrivate*)->handle
-        int dev_fd = ((int*) dev_handle)[10 + 2 + 4 + 2 + 1 + 1]; //(struct linux_device_handle_priv*)->fd
-        g_assert_no_errno(tdev->usb_fd = dup(dev_fd));
-
-        if(!g_usb_device_close(usb_dev, &error)) {
-            dispose_dev(tdev);
-            g_task_return_error(task, error);
-            g_object_unref(task);
-            return;
+    //Find and open the image channel partner
+    if(tdev->img_fd < 0) {
+        char img_path[HIDRAW_PATH_MAX];
+        if(hidraw_find_image_partner(tdev->hidraw_path, img_path, sizeof(img_path))) {
+            tdev->img_fd = open(img_path, O_RDWR | O_NONBLOCK);
+            if(tdev->img_fd < 0) {
+                g_info("Could not open image channel %s: %s (continuing without it)", img_path, g_strerror(errno));
+            } else {
+                g_info("Opened image channel partner: %s", img_path);
+            }
         }
     }
 
@@ -229,13 +225,17 @@ static void init_host_proc(FpiDeviceTudor *tdev, GTask *task, GUsbDevice *usb_de
     if(loglvl < LOG_VERBOSE) loglvl = LOG_VERBOSE;
     if(loglvl > LOG_ERROR) loglvl = LOG_ERROR;
 
-    tdev->send_msg->transfer_fd = tdev->usb_fd;
-    tdev->send_msg->size = sizeof(struct ipc_msg_init); 
+    tdev->send_msg->transfer_fd = dup(tdev->cmd_fd);
+    if(tdev->img_fd >= 0) {
+        tdev->send_msg->transfer_fd2 = dup(tdev->img_fd);
+    } else {
+        tdev->send_msg->transfer_fd2 = -1;
+    }
+    tdev->send_msg->size = sizeof(struct ipc_msg_init);
     tdev->send_msg->init = (struct ipc_msg_init) {
         .type = IPC_MSG_INIT,
         .log_level = loglvl,
-        .usb_bus = g_usb_device_get_bus(usb_dev),
-        .usb_addr = g_usb_device_get_address(usb_dev)
+        .has_image_channel = (tdev->img_fd >= 0)
     };
     if(!send_ipc_msg(tdev, tdev->send_msg, &error)) {
         dispose_dev(tdev);
@@ -279,13 +279,10 @@ void open_device(FpiDeviceTudor *tdev, GAsyncReadyCallback callback, gpointer us
         return;
     }
 
-    GUsbDevice *usb_dev = fpi_device_get_usb_device(FP_DEVICE(tdev));
     int sock_fd;
 
     //Try to adopt a host process
-    guint8 usb_bus = g_usb_device_get_bus(usb_dev), usb_addr = g_usb_device_get_address(usb_dev);
-
-    bool did_adopt = adopt_host_process(tdev, usb_bus, usb_addr, &sock_fd, &error);
+    bool did_adopt = adopt_host_process(tdev, tdev->hidraw_path, &sock_fd, &error);
     if(!did_adopt) {
         if(error) {
             g_warning("Failed to adopt Tudor host process - is tudor-host-launcher.service running? Error: '%s' (%s code %d)", error->message, g_quark_to_string(error->domain), error->code);
@@ -296,15 +293,15 @@ void open_device(FpiDeviceTudor *tdev, GAsyncReadyCallback callback, gpointer us
         }
 
         //Start a host process
-        if(!start_host_process(tdev, usb_bus, usb_addr, &sock_fd, &error)) {
+        if(!start_host_process(tdev, tdev->hidraw_path, &sock_fd, &error)) {
             g_warning("Failed to start Tudor host process - is tudor-host-launcher.service running? Error: '%s' (%s code %d)", error->message, g_quark_to_string(error->domain), error->code);
             dispose_dev(tdev);
             g_task_return_error(task, error);
             g_object_unref(task);
             return;
         }
-        g_info("Started tudor host process ID %u for USB bus 0x%04hx addr 0x%04hx", tdev->host_id, usb_bus, usb_addr);
-    } else g_info("Adopted tudor host process ID %u for USB bus 0x%04hx addr 0x%04hx", tdev->host_id, usb_bus, usb_addr);
+        g_info("Started tudor host process ID %u for hidraw %s", tdev->host_id, tdev->hidraw_path);
+    } else g_info("Adopted tudor host process ID %u for hidraw %s", tdev->host_id, tdev->hidraw_path);
 
     //Create the IPC socket
     tdev->ipc_socket = g_socket_new_from_fd(sock_fd, &error);
@@ -318,7 +315,7 @@ void open_device(FpiDeviceTudor *tdev, GAsyncReadyCallback callback, gpointer us
     tdev->ipc_cancel = g_cancellable_new();
 
     //Initialize the host process if we started a new one
-    if(!did_adopt) init_host_proc(tdev, task, usb_dev);
+    if(!did_adopt) init_host_proc(tdev, task);
     else {
         g_task_return_int(task, 0);
         g_object_unref(task);
@@ -461,6 +458,30 @@ static void probe_open_cb(GObject *src_obj, GAsyncResult *res, gpointer user_dat
 void fpi_device_tudor_probe(FpDevice *dev) {
     FpiDeviceTudor *tdev = FPI_DEVICE_TUDOR(dev);
 
+    //Get the hidraw device path from udev
+    const gchar *hidraw_path = (const gchar *)fpi_device_get_udev_data(dev, FPI_DEVICE_UDEV_SUBTYPE_HIDRAW);
+    if(!hidraw_path) {
+        fpi_device_probe_complete(dev, NULL, NULL,
+            fpi_device_error_new(FP_DEVICE_ERROR_NOT_SUPPORTED));
+        return;
+    }
+
+    //Check if this is actually the fingerprint command channel
+    //Extract hidraw name from path for the check
+    const gchar *hidraw_name = strrchr(hidraw_path, '/');
+    if(hidraw_name) hidraw_name++;
+    else hidraw_name = hidraw_path;
+
+    if(!hidraw_is_fp_command_channel(hidraw_name)) {
+        fpi_device_probe_complete(dev, NULL, NULL,
+            fpi_device_error_new(FP_DEVICE_ERROR_NOT_SUPPORTED));
+        return;
+    }
+
+    //Store the path
+    tdev->hidraw_path = g_strdup(hidraw_path);
+    g_info("Tudor probe: hidraw command channel at %s", tdev->hidraw_path);
+
     //Open the device
     open_device(tdev, probe_open_cb, NULL);
 }
@@ -482,24 +503,10 @@ static void dev_open_cb(GObject *src_obj, GAsyncResult *res, gpointer user_data)
 }
 
 void fpi_device_tudor_open(FpDevice *dev) {
-    //Close the USB device
-    GError *error = NULL;
-    if(!g_usb_device_close(fpi_device_get_usb_device(dev), &error)) {
-        fpi_device_open_complete(dev, error);
-        return;
-    }
-
     //Open the device
     open_device(FPI_DEVICE_TUDOR(dev), dev_open_cb, NULL);
 }
 
 void fpi_device_tudor_close(FpDevice *dev) {
-    //Open the USB device
-    GError *error = NULL;
-    if(!g_usb_device_open(fpi_device_get_usb_device(dev), &error)) {
-        fpi_device_close_complete(dev, error);
-        return;
-    }
-
     fpi_device_close_complete(dev, NULL);
 }

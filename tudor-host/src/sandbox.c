@@ -19,7 +19,6 @@
 #include <seccomp.h>
 #include <tudor/log.h>
 #include "sandbox.h"
-#include "ipc.h"
 
 #define strfy(x) _strfy(x)
 #define _strfy(x) #x
@@ -29,27 +28,6 @@ static struct utsname sbox_utsname;
 int uname(struct utsname *oname) {
     *oname = sbox_utsname;
     return 0;
-}
-
-static int sbox_usb_fd;
-static uint8_t sbox_usb_bus, sbox_usb_addr;
-
-ssize_t readlink(const char *path, char *buf, size_t size) {
-    //Check if path is /proc/self/fd/<FD>
-    int fd;
-    if(sscanf(path, "/proc/self/fd/%d", &fd) != 1) {
-        log_error("Tried to readlink prohibited path '%s'!", path);
-        abort();
-    }
-
-    //Check for the USB FD
-    if(fd != sbox_usb_fd) {
-        log_error("Tried to get path of prohibited FD %d!", fd);
-        abort();
-    }
-
-    //Return a string immetating a device with the specific bus / address
-    return snprintf(buf, size, "/dev/bus/usb/%hhu/%hhu", sbox_usb_bus, sbox_usb_addr);
 }
 
 static void write_to(const char *fname, const char *cnts) {
@@ -249,8 +227,3 @@ void activate_sandbox() {
     setup_seccomp();
 }
 
-void setup_usb_sbox(int usb_fd, uint8_t usb_bus, uint8_t usb_addr) {
-    sbox_usb_fd = usb_fd;
-    sbox_usb_bus = usb_bus;
-    sbox_usb_addr = usb_addr;
-}

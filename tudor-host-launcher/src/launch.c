@@ -11,7 +11,7 @@ struct host_entry {
     guint id;
     GPid pid;
     int pipe_fd;
-    guint8 usb_bus, usb_addr;
+    gchar hidraw_path[64];
 };
 static GArray *hosts_array;
 static guint next_host_id = 1;
@@ -33,10 +33,10 @@ static GDBusArgInfo host_id_arg = {
     .annotations = (GDBusAnnotationInfo*[]) { NULL }
 };
 
-static GDBusArgInfo usb_id_arg = {
+static GDBusArgInfo hidraw_path_arg = {
     .ref_count = -1,
-    .name = "hostId",
-    .signature = "(yy)",
+    .name = "hidrawPath",
+    .signature = "s",
     .annotations = (GDBusAnnotationInfo*[]) { NULL }
 };
 
@@ -110,7 +110,7 @@ static GDBusArgInfo pipe_fd_arg = {
 GDBusMethodInfo launcher_launch_method = {
     .ref_count = -1,
     .name = TUDOR_HOST_LAUNCHER_LAUNCH_METHOD,
-    .in_args = (GDBusArgInfo*[]) { &usb_id_arg, NULL },
+    .in_args = (GDBusArgInfo*[]) { &hidraw_path_arg, NULL },
     .out_args = (GDBusArgInfo*[]) { &host_id_arg, &pipe_fd_arg, NULL },
     .annotations = (GDBusAnnotationInfo*[]) { NULL }
 };
@@ -121,18 +121,18 @@ static void host_setup(gpointer user_data) {
 
 void launch_host_call(GDBusMethodInvocation *invoc, GVariant *params) {
     //Parse arguments
-    if(!g_variant_check_format_string(params, "((yy))", FALSE)) {
+    if(!g_variant_check_format_string(params, "(s)", FALSE)) {
         g_dbus_method_invocation_return_error(invoc, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS, "Invalid argument format");
         return;
     }
 
-    guint8 usb_bus, usb_addr;
-    g_variant_get(params, "((yy))", &usb_bus, &usb_addr);
+    const gchar *hidraw_path;
+    g_variant_get(params, "(&s)", &hidraw_path);
 
-    //Check that there's no host for this USB device yet
+    //Check that there's no host for this hidraw device yet
     for(int i = 0; i < hosts_array->len; i++) {
         struct host_entry *entry = &g_array_index(hosts_array, struct host_entry, i);
-        if(entry->usb_bus != usb_bus || entry->usb_addr != usb_addr) continue;
+        if(strcmp(entry->hidraw_path, hidraw_path) != 0) continue;
 
         //Clean up conflicting orphaned hosts
         if(entry->orphan) {
@@ -141,7 +141,7 @@ void launch_host_call(GDBusMethodInvocation *invoc, GVariant *params) {
             break;
         }
 
-        g_dbus_method_invocation_return_error(invoc, G_DBUS_ERROR, G_DBUS_ERROR_OBJECT_PATH_IN_USE, "A host for this USB device already exists");
+        g_dbus_method_invocation_return_error(invoc, G_DBUS_ERROR, G_DBUS_ERROR_OBJECT_PATH_IN_USE, "A host for this hidraw device already exists");
         return;
     }
 
@@ -186,9 +186,9 @@ void launch_host_call(GDBusMethodInvocation *invoc, GVariant *params) {
     guint host_id = next_host_id++;
     struct host_entry entry = (struct host_entry) {
         .alive = true, .orphan = false,
-        .id = host_id, .pid = pid,
-        .usb_bus = usb_bus, .usb_addr = usb_addr
+        .id = host_id, .pid = pid
     };
+    g_strlcpy(entry.hidraw_path, hidraw_path, sizeof(entry.hidraw_path));
     g_assert_no_errno(entry.pipe_fd = dup(pipe_sock));
     g_array_append_val(hosts_array, entry);
 
@@ -196,7 +196,7 @@ void launch_host_call(GDBusMethodInvocation *invoc, GVariant *params) {
     g_child_watch_add(pid, host_watch_cb, GUINT_TO_POINTER(host_id));
 
     //Pass results back to caller
-    g_info("Launched Tudor host process ID %u PID %d for USB bus 0x%04hx addr 0x%04hx", host_id, pid, usb_bus, usb_addr);
+    g_info("Launched Tudor host process ID %u PID %d for hidraw %s", host_id, pid, hidraw_path);
     g_dbus_method_invocation_return_value_with_unix_fd_list(invoc, g_variant_new("(uh)", host_id, 0), g_unix_fd_list_new_from_array(&pipe_sock, 1));
 }
 
@@ -224,10 +224,11 @@ void kill_host_call(GDBusMethodInvocation *invoc, GVariant *params) {
     for(int i = 0; i < hosts_array->len; i++) {
         struct host_entry *entry = &g_array_index(hosts_array, struct host_entry, i);
         if(entry->id == host_id) {
+            GPid pid = entry->pid;
             free_host(entry);
             g_array_remove_index_fast(hosts_array, i);
 
-            g_info("Killed Tudor host process ID %u PID %d", host_id, entry->pid);
+            g_info("Killed Tudor host process ID %u PID %d", host_id, pid);
             g_dbus_method_invocation_return_value(invoc, NULL);
             return;
         }
@@ -241,25 +242,25 @@ void kill_host_call(GDBusMethodInvocation *invoc, GVariant *params) {
 GDBusMethodInfo launcher_adopt_method = {
     .ref_count = -1,
     .name = TUDOR_HOST_LAUNCHER_ADOPT_METHOD,
-    .in_args = (GDBusArgInfo*[]) { &usb_id_arg, NULL },
+    .in_args = (GDBusArgInfo*[]) { &hidraw_path_arg, NULL },
     .out_args = (GDBusArgInfo*[]) { &host_id_arg, &pipe_fd_arg, NULL },
     .annotations = (GDBusAnnotationInfo*[]) { NULL }
 };
 
 void adopt_host_call(GDBusMethodInvocation *invoc, GVariant *params) {
     //Parse arguments
-    if(!g_variant_check_format_string(params, "((yy))", FALSE)) {
+    if(!g_variant_check_format_string(params, "(s)", FALSE)) {
         g_dbus_method_invocation_return_error(invoc, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS, "Invalid argument format");
         return;
     }
 
-    guint8 usb_bus, usb_addr;
-    g_variant_get(params, "((yy))", &usb_bus, &usb_addr);
+    const gchar *hidraw_path;
+    g_variant_get(params, "(&s)", &hidraw_path);
 
     //Find an orphaned host to adopt
     for(int i = 0; i < hosts_array->len; i++) {
         struct host_entry *entry = &g_array_index(hosts_array, struct host_entry, i);
-        if(!entry->orphan || entry->usb_bus != usb_bus || entry->usb_addr != usb_addr) continue;
+        if(!entry->orphan || strcmp(entry->hidraw_path, hidraw_path) != 0) continue;
         g_assert_true(entry->alive);
 
         //Adopt the host
