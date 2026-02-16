@@ -351,34 +351,6 @@ static void shutdown_host(FpiDeviceTudor *tdev) {
     tdev->close_timeout_src = fpi_device_add_timeout(FP_DEVICE(tdev), SHUTDOWN_TIMEOUT_SECS * 1000, shutdown_timeout_cb, NULL, NULL);
 }
 
-static void orphan_clear_acked_cb(GObject *src_obj, GAsyncResult *res, gpointer user_data) {
-    GTask *task = G_TASK(res);
-    FpiDeviceTudor *tdev = FPI_DEVICE_TUDOR(src_obj);
-
-    //Check for errors
-    GError *error = NULL;
-    IPCMessageBuf *msg = g_task_propagate_pointer(task, &error);
-    if(!msg) goto error;
-    ipc_msg_buf_free(msg);
-
-    g_debug("Tudor host ACKed record clearing for orphaning");
-
-    //Orphan the host process
-    if(!orphan_host_process(tdev, &error)) goto error;
-
-    g_info("Orphaned Tudor device host ID %u", tdev->host_id);
-
-    g_task_return_int(tdev->close_task, 0);
-    dispose_dev(tdev);
-    return;
-
-    error:;
-    g_warning("Failed to orphan Tudor host process: %s (%s code %d)", error->message, g_quark_to_string(error->domain), error->code);
-    g_clear_error(&error);
-
-    shutdown_host(tdev);
-}
-
 void close_device(FpiDeviceTudor *tdev, bool orphan_host, GAsyncReadyCallback callback, gpointer user_data) {
     //Create task
     GTask *task = g_task_new(tdev, NULL, callback, user_data);
@@ -394,10 +366,19 @@ void close_device(FpiDeviceTudor *tdev, bool orphan_host, GAsyncReadyCallback ca
     tdev->close_task = task;
 
     if(orphan_host) {
-        //Clear the host prints, then orphan
-        tdev->send_msg->size = sizeof(enum ipc_msg_type);
-        tdev->send_msg->type = IPC_MSG_CLEAR_RECORDS;
-        send_acked_ipc_msg(tdev, tdev->send_msg, orphan_clear_acked_cb, NULL);
+        //Orphan the host process directly without clearing records.
+        //With DLL storage mode, CLEAR_RECORDS would delete templates from
+        //the sensor, destroying enrolled fingerprints.
+        GError *error = NULL;
+        if(!orphan_host_process(tdev, &error)) {
+            g_warning("Failed to orphan Tudor host process: %s (%s code %d)", error->message, g_quark_to_string(error->domain), error->code);
+            g_clear_error(&error);
+            shutdown_host(tdev);
+        } else {
+            g_info("Orphaned Tudor device host ID %u", tdev->host_id);
+            g_task_return_int(tdev->close_task, 0);
+            dispose_dev(tdev);
+        }
     } else shutdown_host(tdev);
 }
 

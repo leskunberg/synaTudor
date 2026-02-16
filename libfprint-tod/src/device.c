@@ -39,7 +39,7 @@ static void ensure_closed(FpiDeviceTudor *tdev) {
         g_info("Closing tudor device host ID %u...", tdev->host_id);
 
         bool cb_called = false;
-        close_device(tdev, true, close_cb, &cb_called);
+        close_device(tdev, false, close_cb, &cb_called);
         while(!cb_called) g_main_context_iteration(NULL, TRUE);
 
         g_debug("Successfully closed tudor device host ID %u", tdev->host_id);
