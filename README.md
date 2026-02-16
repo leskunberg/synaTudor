@@ -58,11 +58,6 @@ Currently targets the Synaptics Tudor fingerprint sensor (06CB:00DD) embedded in
 the Lenovo X1 Fold 16 keyboard (VID:PID 17EF:613E over Bluetooth, 17EF:6142
 over USB). The sensor communicates via HID over hidraw.
 
-**USB mode is required** — the sensor needs both a command channel and an image
-channel (separate HID interfaces), and the image channel is only available over
-USB. Bluetooth mode exposes only a single hidraw device without the image
-channel, which is insufficient for fingerprint capture.
-
 ## Structure
 This project is split over multiple folders, all providing different parts of
 the functionality:
