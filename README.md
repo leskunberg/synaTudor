@@ -12,6 +12,47 @@ AS PART OF THIS PROJECT, INCLUDING, BUT NOT LIMITED TO, BRICKED SENSORS,
 CORRUPTED FIRMWARE, BYPASSES OF HOST SECURITY, AND VULNERABILITIES IN THE CODE.
 USE AT YOUR OWN RISK.
 
+## Fork Changes
+This is a fork of [Popax21/synaTudor](https://github.com/Popax21/synaTudor) with
+substantial changes to support the Lenovo X1 Fold 16 keyboard's fingerprint
+sensor, which sits behind a HID composite device rather than being a standalone
+USB device.
+
+### Transport: libusb to hidraw
+The original project used libusb for USB communication. This fork replaces the
+entire transport layer with hidraw, which is necessary because the sensor is
+exposed as multiple HID interfaces within a composite keyboard device. A new
+`hidraw_detect` module in libtudor auto-detects the correct command and image
+channel hidraw devices by parsing HID report descriptors and walking sysfs.
+
+### Newer DLL version
+The driver DLLs (synaFpAdapter153.dll, synaWudfBioHid153.dll) are bundled
+directly rather than downloaded from an installer. This newer DLL version
+required extensive new WinAPI stubs (HID, SetupAPI, User32, console, power
+management, RPC, security, WTS, and WDF HID support).
+
+### DLL storage mode
+Uses the DLL's own `WbioQueryStorageInterface` for template storage — templates
+are stored on the sensor itself rather than in host memory. This means
+`IdentifyFeatureSet` queries the sensor directly and newly enrolled templates are
+immediately available without restarting the DLL.
+
+### fprintd integration
+The libfprint-tod plugin, tudor-host, and tudor-host-launcher have all been
+updated for hidraw:
+- libfprint-tod uses `FPI_DEVICE_UDEV_SUBTYPE_HIDRAW` and sends hidraw fds via
+  SCM_RIGHTS
+- tudor-host-launcher identifies devices by hidraw path (was USB bus:addr)
+- Verification uses identify (biometric search) instead of verify (GUID lookup),
+  because the DLL doesn't preserve GUIDs in its storage
+
+### Other notable changes
+- Pre-load libgcc_s.so.1 before sandbox activation (needed for pthread_exit
+  stack unwinding during DLL thread cleanup)
+- Pairing data caching in tudor-host to avoid redundant IPC round-trips
+- No device reopen after enrollment (DLL storage mode makes it unnecessary, and
+  reopening causes the DLL's TLS session to hang)
+
 ## Supported Hardware
 Currently targets the Synaptics Tudor fingerprint sensor (06CB:00DD) embedded in
 the Lenovo X1 Fold 16 keyboard (VID:PID 17EF:613E over Bluetooth, 17EF:6142
@@ -41,12 +82,10 @@ the functionality:
 
 ## Building / Installation
 The same build system used by libfprint, meson, is used for this project.
-During the first build, the Windows driver is automatically downloaded and
-extracted. `innoextract` has to be installed for this.
+The Windows driver DLLs are bundled in `libtudor/dlls/`.
 
 ### Dependencies
 - meson (>= 0.57.0)
-- innoextract (for driver extraction)
 - libcrypto (OpenSSL)
 - libcap
 - libseccomp
