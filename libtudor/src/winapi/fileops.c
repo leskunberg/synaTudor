@@ -120,162 +120,185 @@ typedef struct {
  * The DLL opens HID devices via CreateFileA with FILE_FLAG_OVERLAPPED,
  * then does async ReadFile (input reports) and WriteFile (output reports).
  * We route these to the global hidraw fd.
+ *
+ * A single persistent reader thread per fd handles all async reads.
+ * Read requests are queued and the reader thread dispatches reports to
+ * the oldest pending request. This avoids spawning unbounded threads
+ * (on BT, many non-FP reports are filtered in a loop, so thread-per-read
+ * causes threads to accumulate past sandbox limits).
  */
 
-struct hid_read_args {
-    int fd;
+struct hid_read_req {
     OVERLAPPED *ovlp;
     void *buf;
     size_t buf_size;
+    struct hid_read_req *next;
 };
 
-static void *hid_read_thread(void *arg) {
-    struct hid_read_args *a = (struct hid_read_args *)arg;
-    log_debug("hid_read_thread: reading fd=%d buf_size=%zu", a->fd, a->buf_size);
+struct hid_reader_ctx {
+    int fd;
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool thread_started;
+    bool shutdown;
+    struct hid_read_req *queue_head;
+    struct hid_read_req *queue_tail;
+};
 
-    ssize_t n;
-    for(;;) {
-        n = read(a->fd, a->buf, a->buf_size);
-        if(n < 0) {
-            if(errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* fd is non-blocking; wait for data with bounded poll */
-                struct pollfd pfd = { .fd = a->fd, .events = POLLIN };
-                int pret = poll(&pfd, 1, 500);
-                if(tudor_shutting_down) { n = -1; errno = ECANCELED; break; }
-                if(pret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-                    break; /* fd closed or error */
+/*
+ * Single persistent reader thread. Waits for queued read requests,
+ * reads from hidraw, filters non-FP/heartbeat reports, and completes
+ * the oldest pending request when a valid report arrives.
+ */
+static void *hid_reader_thread(void *arg) {
+    struct hid_reader_ctx *rctx = (struct hid_reader_ctx *)arg;
+    log_info("hid_reader_thread: started for fd=%d", rctx->fd);
+
+    while(!tudor_shutting_down && !rctx->shutdown) {
+        /* Wait for a pending read request */
+        pthread_mutex_lock(&rctx->lock);
+        while(!rctx->queue_head && !tudor_shutting_down && !rctx->shutdown) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 1;
+            pthread_cond_timedwait(&rctx->cond, &rctx->lock, &ts);
+        }
+        if(tudor_shutting_down || rctx->shutdown) {
+            /* Cancel all pending reads */
+            struct hid_read_req *r = rctx->queue_head;
+            rctx->queue_head = rctx->queue_tail = NULL;
+            pthread_mutex_unlock(&rctx->lock);
+            while(r) {
+                struct hid_read_req *next = r->next;
+                winio_complete_overlapped(r->ovlp, STATUS_CANCELLED, 0);
+                free(r);
+                r = next;
+            }
+            break;
+        }
+        struct hid_read_req *req = rctx->queue_head;
+        rctx->queue_head = req->next;
+        if(!rctx->queue_head) rctx->queue_tail = NULL;
+        pthread_mutex_unlock(&rctx->lock);
+
+        /* Read loop with filtering (same logic as before) */
+        ssize_t n;
+        for(;;) {
+            n = read(rctx->fd, req->buf, req->buf_size);
+            if(n < 0) {
+                if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                    struct pollfd pfd = { .fd = rctx->fd, .events = POLLIN };
+                    int pret = poll(&pfd, 1, 500);
+                    if(tudor_shutting_down || rctx->shutdown) { n = -1; errno = ECANCELED; break; }
+                    if(pret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+
+            uint8_t *data = (uint8_t*)req->buf;
+
+            /* On BT, filter non-FP reports (keyboard, consumer, etc.) */
+            if(n > 0 && data[0] != 0x0F && data[0] != 0x10) {
+                static int non_fp_skip = 0;
+                non_fp_skip++;
+                if(non_fp_skip <= 3 || (non_fp_skip % 50) == 0) {
+                    log_info("hid_reader: skipping non-FP report id=0x%02x len=%zd (skip#%d)", data[0], n, non_fp_skip);
                 }
                 continue;
             }
-            break; /* real error (EBADF, etc.) */
-        }
-        /*
-         * Skip synaptic heartbeat ack reports (types 0x01 and 0x02 only).
-         * On Linux hidraw, SetFeature responses arrive as input reports
-         * (report 0x10). The DLL doesn't expect idle heartbeats — on
-         * Windows they go through the control pipe.
-         * Pattern: 20 bytes, report_id=0x10, "synaptic" header, total_len=7.
-         *
-         * IMPORTANT: Only skip type 0x01 (idle A) and 0x02 (idle B).
-         * Other types (0x03, 0x04, etc.) may be event notifications
-         * (e.g., finger detected) and MUST be passed to the DLL.
-         */
-        uint8_t *data = (uint8_t*)a->buf;
 
-        /*
-         * On BT, hidraw0 delivers ALL non-multitouch reports:
-         * keyboard (0x01), consumer (0x02-0x0D), AND fingerprint (0x0F/0x10).
-         * Only fingerprint report IDs should reach the DLL.
-         */
-        if(n > 0 && data[0] != 0x0F && data[0] != 0x10) {
-            static int non_fp_skip = 0;
-            non_fp_skip++;
-            if(non_fp_skip <= 3 || (non_fp_skip % 50) == 0) {
-                log_info("hid_read_thread: skipping non-FP report id=0x%02x len=%zd (skip#%d)", data[0], n, non_fp_skip);
-            }
-            continue;
-        }
-
-        if(n == 20 && data[0] == 0x10 &&
-           memcmp(data + 1, "synaptic", 8) == 0 &&
-           data[9] == 0x07 && data[10] == 0x00 && data[11] == 0x00 && data[12] == 0x00) {
-            uint8_t hb_type = data[13];
-            /*
-             * vfmCaptureProcess interprets: 1=idle/no-finger, 2=FD_DETECTED, 4=RESTART.
-             *
-             * When win_hid_pass_heartbeats is true (after "wait event"), pass ALL
-             * event types to the DLL. The DLL needs both:
-             *   - type 0x02 for "finger detected" (finger down)
-             *   - type 0x01 for "idle/no finger" (finger removed)
-             * Each enrollment touch requires multiple wait/end cycles
-             * (detect down, detect up, confirm).
-             *
-             * When false (pre-capture), filter types 0x01 and 0x02 as heartbeats
-             * since they'd confuse the DLL's ReadFile loop.
-             */
-            /*
-             * Pre-capture filter: when pass_heartbeats is false (before
-             * "wait event" or after "end event"), filter types 0x01/0x02
-             * as idle heartbeats. This prevents stale heartbeats from
-             * reaching the DLL during TLS communication where it expects
-             * 0x0F data reports.
-             */
-            if(!win_hid_pass_heartbeats && (hb_type == 0x01 || hb_type == 0x02)) {
-                static int hb_skip_count = 0;
-                hb_skip_count++;
-                if(hb_skip_count <= 3 || (hb_skip_count % 20) == 0) {
-                    log_info("hid_read_thread: skipping heartbeat type=0x%02x seq=0x%02x (skip#%d, capture inactive)",
-                             hb_type, data[19], hb_skip_count);
+            /* Filter synaptic heartbeats when not in capture mode */
+            if(n == 20 && data[0] == 0x10 &&
+               memcmp(data + 1, "synaptic", 8) == 0 &&
+               data[9] == 0x07 && data[10] == 0x00 && data[11] == 0x00 && data[12] == 0x00) {
+                uint8_t hb_type = data[13];
+                if(!win_hid_pass_heartbeats && (hb_type == 0x01 || hb_type == 0x02)) {
+                    static int hb_skip_count = 0;
+                    hb_skip_count++;
+                    if(hb_skip_count <= 3 || (hb_skip_count % 20) == 0) {
+                        log_info("hid_reader: skipping heartbeat type=0x%02x seq=0x%02x (skip#%d, capture inactive)",
+                                 hb_type, data[19], hb_skip_count);
+                    }
+                    continue;
                 }
-                continue;
+                if(win_hid_pass_heartbeats) {
+                    log_info("hid_reader: event type=0x%02x seq=0x%02x source=0x%02x → DLL",
+                             hb_type, data[19], data[18]);
+                }
             }
-            if(win_hid_pass_heartbeats) {
-                log_info("hid_read_thread: event type=0x%02x seq=0x%02x source=0x%02x → DLL",
-                         hb_type, data[19], data[18]);
-            }
+            break; /* got a real report */
         }
-        break; /* got a real report */
+
+        /* Zero-pad to match Windows HID InputReportByteLength behavior */
+        if(n > 0 && (size_t)n < req->buf_size) {
+            memset((uint8_t*)req->buf + n, 0, req->buf_size - n);
+            n = (ssize_t)req->buf_size;
+        }
+
+        if(n > 0) {
+            char hexbuf[80];
+            int hlen = 0;
+            for(int i = 0; i < n && i < 20; i++)
+                hlen += snprintf(hexbuf + hlen, sizeof(hexbuf) - hlen, "%02x ", ((uint8_t*)req->buf)[i]);
+            log_info("hid_reader: read %zd bytes [%s]", n, hexbuf);
+        }
+
+        if(n > 0) {
+            winio_complete_overlapped(req->ovlp, STATUS_SUCCESS, (size_t)n);
+        } else if(n == 0) {
+            winio_complete_overlapped(req->ovlp, STATUS_CANCELLED, 0);
+        } else {
+            log_warn("hid_reader: read error: %s", strerror(errno));
+            winio_complete_overlapped(req->ovlp, STATUS_CANCELLED, 0);
+        }
+        free(req);
     }
 
-    /*
-     * Windows HID ReadFile always returns InputReportByteLength bytes
-     * (64 for our device), zero-padding shorter reports (e.g. report
-     * 0x10 is only 20 bytes). The DLL checks bytes_transferred and
-     * rejects reads that don't match the expected size.
-     */
-    if(n > 0 && (size_t)n < a->buf_size) {
-        memset((uint8_t*)a->buf + n, 0, a->buf_size - n);
-        n = (ssize_t)a->buf_size;
-    }
-
-    if(n > 0) {
-        /* Hex dump first 20 bytes of the report */
-        char hexbuf[80];
-        int hlen = 0;
-        for(int i = 0; i < n && i < 20; i++)
-            hlen += snprintf(hexbuf + hlen, sizeof(hexbuf) - hlen, "%02x ", ((uint8_t*)a->buf)[i]);
-        log_info("hid_read_thread: read %zd bytes [%s]", n, hexbuf);
-    } else {
-        log_debug("hid_read_thread: read returned %zd", n);
-    }
-
-    if(n > 0) {
-        winio_complete_overlapped(a->ovlp, STATUS_SUCCESS, (size_t)n);
-    } else if(n == 0) {
-        winio_complete_overlapped(a->ovlp, STATUS_CANCELLED, 0);
-    } else {
-        log_warn("hid_read_thread: read error: %s", strerror(errno));
-        winio_complete_overlapped(a->ovlp, STATUS_CANCELLED, 0);
-    }
-
-    free(a);
+    log_info("hid_reader_thread: exiting for fd=%d", rctx->fd);
     return NULL;
 }
 
 static NTSTATUS hid_file_read(void *ctx, OVERLAPPED *ovlp, off_t offset, void *buf, size_t buf_size, void **op_ctx) {
-    int fd = *(int *)ctx;
-    log_debug("hid_file_read: starting async read on fd=%d size=%zu", fd, buf_size);
+    struct hid_reader_ctx *rctx = (struct hid_reader_ctx *)ctx;
+    log_debug("hid_file_read: queuing async read on fd=%d size=%zu", rctx->fd, buf_size);
 
-    struct hid_read_args *a = (struct hid_read_args *)malloc(sizeof(struct hid_read_args));
-    if(!a) return STATUS_CANCELLED;
-    a->fd = fd;
-    a->ovlp = ovlp;
-    a->buf = buf;
-    a->buf_size = buf_size;
+    struct hid_read_req *req = (struct hid_read_req *)malloc(sizeof(struct hid_read_req));
+    if(!req) return STATUS_CANCELLED;
+    req->ovlp = ovlp;
+    req->buf = buf;
+    req->buf_size = buf_size;
+    req->next = NULL;
 
-    pthread_t thread;
-    if(pthread_create(&thread, NULL, hid_read_thread, a) != 0) {
-        log_error("hid_file_read: pthread_create failed");
-        free(a);
-        return STATUS_CANCELLED;
+    pthread_mutex_lock(&rctx->lock);
+
+    /* Start reader thread on first read */
+    if(!rctx->thread_started) {
+        if(pthread_create(&rctx->thread, NULL, hid_reader_thread, rctx) != 0) {
+            log_error("hid_file_read: pthread_create failed: %s", strerror(errno));
+            pthread_mutex_unlock(&rctx->lock);
+            free(req);
+            return STATUS_CANCELLED;
+        }
+        rctx->thread_started = true;
     }
-    pthread_detach(thread);
 
+    /* Enqueue */
+    if(rctx->queue_tail) rctx->queue_tail->next = req;
+    else rctx->queue_head = req;
+    rctx->queue_tail = req;
+    pthread_cond_signal(&rctx->cond);
+
+    pthread_mutex_unlock(&rctx->lock);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS hid_file_write(void *ctx, OVERLAPPED *ovlp, off_t offset, const void *buf, size_t buf_size, void **op_ctx) {
-    int fd = *(int *)ctx;
+    struct hid_reader_ctx *rctx = (struct hid_reader_ctx *)ctx;
+    int fd = rctx->fd;
 
     /* Hex dump first 20 bytes of what we're sending */
     char hexbuf[80];
@@ -298,8 +321,19 @@ static NTSTATUS hid_file_write(void *ctx, OVERLAPPED *ovlp, off_t offset, const 
 }
 
 static void hid_file_destroy(void *ctx) {
+    struct hid_reader_ctx *rctx = (struct hid_reader_ctx *)ctx;
+    /* Signal reader thread to stop and wait for it */
+    pthread_mutex_lock(&rctx->lock);
+    rctx->shutdown = true;
+    pthread_cond_signal(&rctx->cond);
+    pthread_mutex_unlock(&rctx->lock);
+    if(rctx->thread_started) {
+        pthread_join(rctx->thread, NULL);
+    }
+    pthread_mutex_destroy(&rctx->lock);
+    pthread_cond_destroy(&rctx->cond);
     /* Don't close the fd - it's the global hidraw fd managed elsewhere */
-    free(ctx);
+    free(rctx);
 }
 
 static HANDLE create_hid_file_handle(int fd) {
@@ -308,12 +342,14 @@ static HANDLE create_hid_file_handle(int fd) {
         return winhandle_create(NULL, NULL);
     }
 
-    int *fd_ctx = (int *)malloc(sizeof(int));
-    if(!fd_ctx) { winerr_set_errno(); return NULL; }
-    *fd_ctx = fd;
+    struct hid_reader_ctx *rctx = (struct hid_reader_ctx *)calloc(1, sizeof(struct hid_reader_ctx));
+    if(!rctx) { winerr_set_errno(); return NULL; }
+    rctx->fd = fd;
+    pthread_mutex_init(&rctx->lock, NULL);
+    pthread_cond_init(&rctx->cond, NULL);
 
     log_info("create_hid_file_handle: creating async file handle for hidraw fd=%d", fd);
-    return winio_create_file(fd_ctx, true, hid_file_read, hid_file_write, NULL, NULL, NULL, hid_file_destroy);
+    return winio_create_file(rctx, true, hid_file_read, hid_file_write, NULL, NULL, NULL, hid_file_destroy);
 }
 
 #define FILE_FLAG_OVERLAPPED 0x40000000

@@ -13,6 +13,7 @@ static void dispose_dev(FpiDeviceTudor *tdev) {
     if(tdev->host_has_id && !kill_host_process(tdev, &error)) {
         g_warning("Error cleaning up Tudor host process: %s (%s code %d)", error->message, g_quark_to_string(error->domain), error->code);
         g_clear_error(&error);
+        tdev->host_has_id = false;
     }
 
     //Close the sleep inhibitor (if we got one)
@@ -382,7 +383,7 @@ void close_device(FpiDeviceTudor *tdev, bool orphan_host, GAsyncReadyCallback ca
     //Create task
     GTask *task = g_task_new(tdev, NULL, callback, user_data);
 
-    if(!tdev->host_has_id || tdev->host_dead) {
+    if(!tdev->host_has_id || tdev->host_dead || !tdev->ipc_socket) {
         //Dispose the device directly
         dispose_dev(tdev);
         g_task_return_int(task, 0);
@@ -460,26 +461,26 @@ void fpi_device_tudor_probe(FpDevice *dev) {
 
     //Get the hidraw device path from udev
     const gchar *hidraw_path = (const gchar *)fpi_device_get_udev_data(dev, FPI_DEVICE_UDEV_SUBTYPE_HIDRAW);
+    g_info("Tudor probe: fpi_device_get_udev_data returned: %s", hidraw_path ? hidraw_path : "(NULL)");
     if(!hidraw_path) {
         fpi_device_probe_complete(dev, NULL, NULL,
             fpi_device_error_new(FP_DEVICE_ERROR_NOT_SUPPORTED));
         return;
     }
 
-    //Check if this is actually the fingerprint command channel
-    //Extract hidraw name from path for the check
-    const gchar *hidraw_name = strrchr(hidraw_path, '/');
-    if(hidraw_name) hidraw_name++;
-    else hidraw_name = hidraw_path;
-
-    if(!hidraw_is_fp_command_channel(hidraw_name)) {
+    //Find the FP command channel among this device or its siblings
+    char cmd_path[HIDRAW_PATH_MAX];
+    if(!hidraw_find_fp_command_sibling(hidraw_path, cmd_path, sizeof(cmd_path))) {
+        g_info("Tudor probe: no FP command channel found among %s or siblings, rejecting", hidraw_path);
         fpi_device_probe_complete(dev, NULL, NULL,
             fpi_device_error_new(FP_DEVICE_ERROR_NOT_SUPPORTED));
         return;
     }
 
-    //Store the path
-    tdev->hidraw_path = g_strdup(hidraw_path);
+    //Store the command channel path (may differ from what libfprint gave us)
+    tdev->hidraw_path = g_strdup(cmd_path);
+    if(strcmp(hidraw_path, cmd_path) != 0)
+        g_info("Tudor probe: libfprint gave %s, using command channel sibling %s", hidraw_path, cmd_path);
     g_info("Tudor probe: hidraw command channel at %s", tdev->hidraw_path);
 
     //Open the device

@@ -78,10 +78,14 @@ size_t ipc_recv_msg(int sock, void *buf, enum ipc_msg_type type, size_t min_sz, 
         if(num_fds >= 1) {
             if(fd) *fd = cmsg.fds[0];
             else cant_fail(close(cmsg.fds[0]));
+        } else {
+            if(fd) *fd = -1;
         }
         if(num_fds >= 2) {
             if(fd2) *fd2 = cmsg.fds[1];
             else cant_fail(close(cmsg.fds[1]));
+        } else {
+            if(fd2) *fd2 = -1;
         }
     } else {
         if(fd) *fd = -1;

@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <tudor/tudor.h>
 #include "handler.h"
 
@@ -17,11 +18,6 @@ struct handler_state {
             enum tudor_finger finger;
             bool done;
         } enroll;
-        struct {
-            RECGUID guid;
-            enum tudor_finger finger;
-            bool retry, matches;
-        } verify;
         struct {
             bool retry, has_match;
             RECGUID guid;
@@ -80,8 +76,10 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
 
     //Check success
     if(!success && state->action.enroll.done) {
-        log_error("Enroll action failed!");
-        abort();
+        log_error("Enroll action failed! Discarding enrollment and shutting down.");
+        tudor_enroll_discard(state->dev);
+        cant_fail_ret(pthread_mutex_unlock(&state->lock));
+        exit(1);
     }
 
     //Send response
@@ -94,7 +92,7 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
         }
         if(is_dupl) log_warn("Overwritting duplicate enrollment...");
 
-        //Find the resulting record
+        //Find the resulting record in the in-memory list
         cant_fail_ret(pthread_mutex_lock(&state->dev->records_lock));
 
         struct tudor_record *enroll_rec = NULL;
@@ -104,13 +102,13 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
                 break;
             }
         }
-        if(!enroll_rec) {
-            log_error("Couldn't find enrollment record!");
-            abort();
-        }
 
-        //Allocate response message
-        size_t rec_size = enroll_rec->data_size, resp_size = sizeof(struct ipc_msg_resp_enroll) + rec_size;
+        cant_fail_ret(pthread_mutex_unlock(&state->dev->records_lock));
+
+        //Build response - with template data if available, or empty if using DLL storage
+        //(DLL storage keeps templates on the sensor, loaded via OpenDatabase on init)
+        size_t rec_size = enroll_rec ? enroll_rec->data_size : 0;
+        size_t resp_size = sizeof(struct ipc_msg_resp_enroll) + rec_size;
 
         if(rec_size > IPC_MAX_RECORD_SIZE) {
             log_error("Enrollment record size exceeding maximum size: %lu > %d!", rec_size, IPC_MAX_RECORD_SIZE);
@@ -127,15 +125,26 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
             .retry = false,
             .done = true
         };
-        memcpy(resp->record_data, enroll_rec->data, enroll_rec->data_size);
+        if(enroll_rec && rec_size > 0) {
+            memcpy(resp->record_data, enroll_rec->data, enroll_rec->data_size);
+        }
 
-        cant_fail_ret(pthread_mutex_unlock(&state->dev->records_lock));
+        //NOTE: We do NOT reopen the device after enrollment.
+        //With DLL storage mode, templates are stored on the sensor itself.
+        //IdentifyFeatureSet queries the sensor directly, so it will find
+        //the newly enrolled template without needing a DLL restart.
+        //Reopening causes the DLL's Activate step to hang (sensor TLS
+        //state becomes corrupted during close/reopen cycle).
+
+        if(enroll_rec) {
+            log_info("Enroll capture successfull -> enrollment commited for GUID %08x... finger %d - record size %lu", state->action.enroll.guid.PartA, state->action.enroll.finger, rec_size);
+        } else {
+            log_info("Enroll capture successfull -> enrollment commited for GUID %08x... finger %d (DLL storage, template on sensor)", state->action.enroll.guid.PartA, state->action.enroll.finger);
+        }
 
         //Send response
         ipc_send_msg(state->ipc_sock, resp, resp_size);
         free(resp);
-
-        log_info("Enroll capture successfull -> enrollment commited for GUID %08x... finger %d - record size %lu", state->action.enroll.guid.PartA, state->action.enroll.finger, rec_size);
     } else {
         //Start another capture
         init_action(state);
@@ -165,7 +174,7 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
     cant_fail_ret(pthread_mutex_unlock(&state->lock));
 }
 
-static void verify_cb(tudor_async_res_t *res, bool success, struct handler_state *state) {
+static void verify_via_identify_cb(tudor_async_res_t *res, bool success, struct handler_state *state) {
     cant_fail_ret(pthread_mutex_lock(&state->lock));
 
     if(!cleanup_action(state)) {
@@ -173,39 +182,48 @@ static void verify_cb(tudor_async_res_t *res, bool success, struct handler_state
         return;
     }
 
-    //Check success
-    if(!success && !state->action.verify.retry) {
-        log_error("Verify action failed!");
-        abort();
-    }
-
-    //If we're retrying, start again
-    if(!success) {
+    //Check success - retry on bad capture
+    if(!success && state->action.identify.retry) {
         init_action(state);
-        if(!tudor_verify(state->dev, state->action.verify.guid, state->action.verify.finger, &state->action.verify.retry, &state->action.verify.matches, &state->async_res)) {
-            log_error("Couldn't start verify action retry!");
+        if(!tudor_identify(state->dev, &state->action.identify.retry, &state->action.identify.has_match, &state->action.identify.guid, &state->action.identify.finger, &state->async_res)) {
+            log_error("Couldn't start verify (via identify) retry!");
             abort();
         }
+
+        //Send retry response
+        struct ipc_msg_resp_verify msg = {
+            .type = IPC_MSG_RESP_VERIFY,
+            .retry = true,
+            .did_match = false
+        };
+        ipc_send_msg(state->ipc_sock, &msg, sizeof(msg));
+        log_info("Verify (via identify) capture error -> retrying...");
+
+        cant_fail_ret(pthread_mutex_unlock(&state->lock));
+        tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) verify_via_identify_cb, state);
+        return;
+    }
+
+    if(!success) {
+        log_error("Verify (via identify) action failed!");
+        abort();
     }
 
     //Send response
     struct ipc_msg_resp_verify msg = {
         .type = IPC_MSG_RESP_VERIFY,
-        .retry = !success,
-        .did_match = state->action.verify.matches
+        .retry = false,
+        .did_match = state->action.identify.has_match
     };
     ipc_send_msg(state->ipc_sock, &msg, sizeof(msg));
 
-    if(success) {
-        log_info("Verify GUID %08x... finger %d -> %s match", state->action.verify.guid.PartA, state->action.verify.finger, msg.did_match ? "does" : "doesn't");
+    if(state->action.identify.has_match) {
+        log_info("Verify (via identify) -> matched GUID %08x... finger %d", state->action.identify.guid.PartA, state->action.identify.finger);
     } else {
-        log_info("Verify GUID %08x... finger %d capture error -> retrying...", state->action.verify.guid.PartA, state->action.verify.finger);
+        log_info("Verify (via identify) -> no match");
     }
 
     cant_fail_ret(pthread_mutex_unlock(&state->lock));
-
-    //Only set the callback now to avoid reentrance issues
-    if(!success) tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) verify_cb, state);
 }
 
 static void identify_cb(tudor_async_res_t *res, bool success, struct handler_state *state) {
@@ -222,37 +240,23 @@ static void identify_cb(tudor_async_res_t *res, bool success, struct handler_sta
         abort();
     }
 
-    //If we're retrying, start again
-    if(!success && !state->action.verify.retry) {
-        init_action(state);
-        if(!tudor_identify(state->dev, &state->action.identify.retry, &state->action.identify.has_match, &state->action.identify.guid, &state->action.identify.finger, &state->async_res)) {
-            log_error("Couldn't start identify action retry!");
-            abort();
-        }
-    }
-
     //Send response
     struct ipc_msg_resp_identify msg = {
         .type = IPC_MSG_RESP_IDENTIFY,
-        .retry = !success,
+        .retry = false,
         .did_match = state->action.identify.has_match,
         .guid = state->action.identify.guid,
         .finger = state->action.identify.finger
     };
     ipc_send_msg(state->ipc_sock, &msg, sizeof(msg));
 
-    if(success && msg.did_match) {
+    if(msg.did_match) {
         log_info("Identify result -> matches GUID %08x... finger %d", msg.guid.PartA, msg.finger);
-    } else if(success) {
-        log_info("Identify result -> no match");
     } else {
-        log_info("Identify capture error -> retrying...");
+        log_info("Identify result -> no match");
     }
 
     cant_fail_ret(pthread_mutex_unlock(&state->lock));
-
-    //Only set the callback now to avoid reentrance issues
-    if(!success) tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) identify_cb, state);
 }
 
 static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type type) {
@@ -378,16 +382,17 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
 
             //Initialize state
             init_action(state);
-            state->action.verify.guid = msg.guid;
-            state->action.verify.finger = msg.finger;
 
-            //Start verify action
-            if(!tudor_verify(state->dev, msg.guid, msg.finger, &state->action.verify.retry, &state->action.verify.matches, &state->async_res)) {
-                log_error("Couldn't start verify action!");
+            //Use identify instead of verify - the DLL's VerifyFeatureSet can't look up
+            //templates by GUID because the DLL doesn't preserve GUIDs in its storage.
+            //Identify searches all templates biometrically, which works reliably.
+            log_info("Starting verify (via identify) for GUID %08x... finger %d", msg.guid.PartA, msg.finger);
+            if(!tudor_identify(state->dev, &state->action.identify.retry, &state->action.identify.has_match, &state->action.identify.guid, &state->action.identify.finger, &state->async_res)) {
+                log_error("Couldn't start verify (via identify) action!");
                 abort();
             }
-            log_debug("Started verify action");
-            tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) verify_cb, state);
+            log_debug("Started verify (via identify) action");
+            tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) verify_via_identify_cb, state);
 
             //Send ACK
             send_ack(state->ipc_sock);

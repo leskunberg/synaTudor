@@ -331,7 +331,7 @@ bool tudor_enroll_start(struct tudor_device *device, RECGUID guid, enum tudor_fi
 static void enroll_cb(OVERLAPPED *ovlp, NTSTATUS status, tudor_async_res_t res) {
     winmodule_set_cur(&tudor_adapter_dll->module);
     HRESULT hres;
-    bool success = false, done = true;
+    bool success = false, done = false;
 
     if(status != STATUS_SUCCESS) {
         log_error("Error starting capture: 0x%x!", status);
@@ -387,6 +387,24 @@ bool tudor_enroll_capture(struct tudor_device *device, bool *done, tudor_async_r
     return true;
 }
 
+//Interception state for capturing enrollment template data from DLL storage
+static struct tudor_device *enroll_intercept_device = NULL;
+static WINBIO_STORAGE_INTERFACE enroll_intercept_storage;
+
+__winfnc static HRESULT enroll_intercept_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STORAGE_RECORD *srec) {
+    //Capture the template data into our records_head list
+    if(enroll_intercept_device && srec->Identity && srec->TemplateBlob && srec->TemplateBlobSize > 0) {
+        RECGUID guid = *(RECGUID*) &srec->Identity->TemplateGuid;
+        tudor_add_record(enroll_intercept_device, guid,
+                         (enum tudor_finger) srec->SubFactor,
+                         srec->TemplateBlob, srec->TemplateBlobSize);
+        log_info("Intercepted enrollment AddRecord: guid=%08x finger=%x size=%lu",
+                 guid.PartA, srec->SubFactor, srec->TemplateBlobSize);
+    }
+    //Forward to DLL's original AddRecord
+    return tudor_dll_storage_adapter->AddRecord(pipeline, srec);
+}
+
 bool tudor_enroll_commit(struct tudor_device *device, bool *is_duplicate) {
     winmodule_set_cur(&tudor_adapter_dll->module);
     HRESULT hres;
@@ -410,11 +428,27 @@ bool tudor_enroll_commit(struct tudor_device *device, bool *is_duplicate) {
 
     log_debug("Committing enrollment...");
 
+    //If using DLL storage, intercept AddRecord to capture template data
+    if(device->use_dll_storage) {
+        enroll_intercept_storage = *tudor_dll_storage_adapter;
+        enroll_intercept_storage.AddRecord = enroll_intercept_AddRecord;
+        enroll_intercept_device = device;
+        device->pipeline->StorageInterface = &enroll_intercept_storage;
+    }
+
     //The driver doesn't support enrollment hashes (so we don't call GetEnrollmentHash)
-    if((hres = tudor_engine_adapter->CommitEnrollment(device->pipeline, &(WINBIO_IDENTITY) {
+    hres = tudor_engine_adapter->CommitEnrollment(device->pipeline, &(WINBIO_IDENTITY) {
         .Type = WINBIO_ID_TYPE_GUID,
         .TemplateGuid = *(GUID*) &device->enroll_guid
-    }, (UCHAR) device->enroll_finger, NULL, 0)) != ERROR_SUCCESS) {
+    }, (UCHAR) device->enroll_finger, NULL, 0);
+
+    //Restore original storage interface
+    if(device->use_dll_storage) {
+        device->pipeline->StorageInterface = tudor_dll_storage_adapter;
+        enroll_intercept_device = NULL;
+    }
+
+    if(hres != ERROR_SUCCESS) {
         log_error("Error committing enrollment: 0x%x!", hres);
         if(hres == WINBIO_E_DUPLICATE_ENROLLMENT) *is_duplicate = true;
         return false;

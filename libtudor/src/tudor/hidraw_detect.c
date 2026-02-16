@@ -166,6 +166,17 @@ bool hidraw_find_image_partner(const char *cmd_path, char *img_path, size_t img_
     else cmd_name++;
 
     /*
+     * First check if the command channel device itself also has image reports.
+     * On BT, both command and image reports are on the same hidraw device.
+     */
+    struct rdesc_info self_info = {0};
+    if(check_report_descriptor(cmd_name, &self_info) && self_info.has_img_reports) {
+        snprintf(img_path, img_path_max, "%s", cmd_path);
+        log_info("hidraw_detect: command channel %s also has image reports (BT mode)", cmd_path);
+        return true;
+    }
+
+    /*
      * Walk sysfs to find the parent HID device, then find sibling hidraw
      * devices that have image channel reports.
      *
@@ -222,6 +233,62 @@ bool hidraw_find_image_partner(const char *cmd_path, char *img_path, size_t img_
         log_info("hidraw_detect: found image partner %s for %s", img_path, cmd_path);
         found = true;
         break;
+    }
+    closedir(dir);
+    return found;
+}
+
+bool hidraw_find_fp_command_sibling(const char *any_path, char *cmd_path, size_t cmd_path_max) {
+    const char *any_name = strrchr(any_path, '/');
+    if(!any_name) any_name = any_path;
+    else any_name++;
+
+    /* First check if this device itself is the command channel */
+    if(hidraw_is_fp_command_channel(any_name)) {
+        snprintf(cmd_path, cmd_path_max, "/dev/%s", any_name);
+        return true;
+    }
+
+    /* Walk siblings under the same parent HID device */
+    char device_link[512];
+    char resolved[512];
+    snprintf(device_link, sizeof(device_link), "/sys/class/hidraw/%s/device", any_name);
+
+    ssize_t len = readlink(device_link, resolved, sizeof(resolved) - 1);
+    if(len < 0) return false;
+    resolved[len] = '\0';
+
+    char *parent_end = strrchr(resolved, '/');
+    if(!parent_end) return false;
+    size_t parent_len = (size_t)(parent_end - resolved);
+
+    DIR *dir = opendir("/sys/class/hidraw");
+    if(!dir) return false;
+
+    bool found = false;
+    struct dirent *ent;
+    while((ent = readdir(dir)) != NULL) {
+        if(strncmp(ent->d_name, "hidraw", 6) != 0) continue;
+        if(strcmp(ent->d_name, any_name) == 0) continue;
+
+        char other_link[512];
+        char other_resolved[512];
+        snprintf(other_link, sizeof(other_link), "/sys/class/hidraw/%s/device", ent->d_name);
+
+        ssize_t other_len = readlink(other_link, other_resolved, sizeof(other_resolved) - 1);
+        if(other_len < 0) continue;
+        other_resolved[other_len] = '\0';
+
+        if((size_t)other_len <= parent_len) continue;
+        if(strncmp(resolved, other_resolved, parent_len) != 0) continue;
+
+        /* Same parent — check if this one is the command channel */
+        if(hidraw_is_fp_command_channel(ent->d_name)) {
+            snprintf(cmd_path, cmd_path_max, "/dev/%s", ent->d_name);
+            log_info("hidraw_detect: found command channel sibling %s for %s", cmd_path, any_path);
+            found = true;
+            break;
+        }
     }
     closedir(dir);
     return found;

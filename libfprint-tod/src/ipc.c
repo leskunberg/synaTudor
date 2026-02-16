@@ -140,6 +140,12 @@ bool send_ipc_msg(FpiDeviceTudor *tdev, IPCMessageBuf *msg, GError **error) {
     //Check if host process is dead
     if(check_host_proc_dead(tdev, error)) return false;
 
+    //Check if IPC socket is available
+    if(!tdev->ipc_socket) {
+        *error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "IPC socket is not available");
+        return false;
+    }
+
     //Send message
     GOutputVector iv = {
         .buffer = msg->data,

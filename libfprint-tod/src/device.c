@@ -172,6 +172,8 @@ static void fpi_device_tudor_class_init(FpiDeviceTudorClass *class) {
     dev_class->id_table = tudor_ids;
     dev_class->nr_enroll_stages = TUDOR_NUM_ENROLL_STAGES;
     dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+    dev_class->temp_hot_seconds = -1;
+    dev_class->temp_cold_seconds = 0;
 
     dev_class->probe = fpi_device_tudor_probe;
     dev_class->open = fpi_device_tudor_open;

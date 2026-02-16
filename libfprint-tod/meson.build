@@ -18,10 +18,11 @@ tudor_tod = shared_module('tudor_tod',
     c_args: ['-D_GNU_SOURCE', '-Wno-missing-braces'],
     dependencies: [libfprint_tod_dep, json_glib_dep, libtudor_dep],
     include_directories: [libtudor_inc, tudor_host_inc, tudor_host_launcher_inc],
+    install_rpath: INSTALL_DIR,
     install: true,
     install_dir: libfprint_tod_dep.get_variable(pkgconfig: 'tod_driversdir')
 )
 
 install_data('60-tudor-libfprint-tod.rules',
-    install_dir: udev_dep.get_variable(pkgconfig: 'udevdir'),
+    install_dir: udev_dep.get_variable(pkgconfig: 'udevdir') / 'rules.d',
 )

@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 
@@ -32,13 +33,13 @@ static void recv_init_msg(int sock, int *cmd_fd, int *img_fd) {
 
 static bool has_sensor_name;
 static int pdata_ipc_sock;
+
+//Cached pairing data — avoids redundant IPC round-trips when the DLL
+//requests pairing data multiple times (e.g. during initialization).
+static const struct tudor_pair_data *cached_pdata = NULL;
+
 static const struct tudor_pair_data *get_pdata_cb(const char *name) {
     log_info("Getting pairing data for sensor '%s'...", name);
-
-    //Send an IPC message to the module
-    struct ipc_msg_load_pdata msg = { .type = IPC_MSG_LOAD_PDATA, .sensor_name = {0} };
-    strncpy(msg.sensor_name, name, IPC_SENSOR_NAME_SIZE);
-    ipc_send_msg(pdata_ipc_sock, &msg, sizeof(msg));
 
     if(has_sensor_name && strcmp(name, probe_sensor_name) != 0){
         log_error("Attempted multiple different sensor pairing data loads!");
@@ -47,6 +48,17 @@ static const struct tudor_pair_data *get_pdata_cb(const char *name) {
         strncpy(probe_sensor_name, name, IPC_SENSOR_NAME_SIZE);
         has_sensor_name = true;
     }
+
+    //Return cached copy if available
+    if(cached_pdata) {
+        log_info("Returning cached pairing data (%lu bytes)", cached_pdata->data_size);
+        return cached_pdata;
+    }
+
+    //Send an IPC message to the module
+    struct ipc_msg_load_pdata msg = { .type = IPC_MSG_LOAD_PDATA, .sensor_name = {0} };
+    strncpy(msg.sensor_name, name, IPC_SENSOR_NAME_SIZE);
+    ipc_send_msg(pdata_ipc_sock, &msg, sizeof(msg));
 
     //Receive the response
     struct {
@@ -65,6 +77,9 @@ static const struct tudor_pair_data *get_pdata_cb(const char *name) {
     pdata->data_size = pdata_sz;
     memcpy(pdata->data, resp.msg.pdata, pdata->data_size);
 
+    //Cache for future calls
+    cached_pdata = pdata;
+
     return pdata;
 }
 
@@ -74,6 +89,21 @@ static void set_pdata_cb(const char *name, const struct tudor_pair_data *data) {
         abort();
     }
     log_info("Setting pairing data for sensor '%s'...", name);
+
+    //Record the sensor name (may be the first time we see it if no prior pdata existed)
+    if(!has_sensor_name) {
+        strncpy(probe_sensor_name, name, IPC_SENSOR_NAME_SIZE);
+        has_sensor_name = true;
+    }
+
+    //Update cache with new pairing data
+    struct tudor_pair_data *pdata = (struct tudor_pair_data*) malloc(sizeof(struct tudor_pair_data) + data->data_size);
+    if(pdata) {
+        pdata->data = pdata+1;
+        pdata->data_size = data->data_size;
+        memcpy(pdata->data, data->data, data->data_size);
+        cached_pdata = pdata;
+    }
 
     //Send an IPC message to the module
     struct {
@@ -111,12 +141,16 @@ int main() {
     }
     int sock = STDIN_FILENO;
 
+    //Pre-load libgcc_s.so.1 before sandboxing — needed by pthread_exit
+    //for stack unwinding during DLL thread cleanup.
+    dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+
     //Activate sandbox
     activate_sandbox();
     log_info("Activated sandbox");
 
     //Receive the init message with hidraw fd(s)
-    int cmd_fd, img_fd;
+    int cmd_fd = -1, img_fd = -1;
     recv_init_msg(sock, &cmd_fd, &img_fd);
     log_info("Received init message - cmd_fd=%d img_fd=%d", cmd_fd, img_fd);
 
@@ -147,10 +181,11 @@ int main() {
     }
     log_info("Opened tudor device");
 
-    //Check that we have determined the sensor name
+    //Use a default sensor name if the DLL didn't provide one via pairing data callbacks
     if(!has_sensor_name) {
-        log_error("Failed to acquire sensor name!");
-        return EXIT_FAILURE;
+        log_info("DLL did not provide sensor name via pairing data, using default");
+        strncpy(probe_sensor_name, "Tudor Sensor", IPC_SENSOR_NAME_SIZE);
+        has_sensor_name = true;
     }
 
     //Send ready message

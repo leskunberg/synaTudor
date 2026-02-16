@@ -35,4 +35,12 @@ bool hidraw_is_fp_command_channel(const char *hidraw_name);
  */
 bool hidraw_find_image_partner(const char *cmd_path, char *img_path, size_t img_path_max);
 
+/*
+ * Given any hidraw device path from the keyboard (e.g. "/dev/hidraw5"),
+ * find the FP command channel hidraw among itself or its siblings.
+ * Returns true and fills cmd_path if found, false otherwise.
+ * If the given device IS the command channel, it returns its own path.
+ */
+bool hidraw_find_fp_command_sibling(const char *any_path, char *cmd_path, size_t cmd_path_max);
+
 #endif
