@@ -18,7 +18,7 @@
 /* HIDIOCGFEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x07, len) */
 #define HIDIOCGFEATURE_20 0xC0144807
 
-bool win_hid_pass_heartbeats = false;
+volatile bool win_hid_pass_heartbeats = false;
 volatile bool tudor_shutting_down = false;
 
 /*

@@ -41,8 +41,8 @@ static NTSTATUS tudor_devctrl(struct tudor_device *device, OVERLAPPED *ovlp, ULO
     winmodule_set_cur(mod);
 
     //Override template count to prevent DATABASE_FULL during enrollment only.
-    //During init/reopen, the DLL needs the real count to trigger DB_INIT (0xA5 01),
-    //which loads biometric templates into the matching engine.
+    //During init/reopen, the DLL needs the real count to load the enrolled templates
+    //into the matching engine. (0xA5 01 is NOT an init - it formats the whole sensor DB.)
     if(code == 0x44202c && status == STATUS_SUCCESS && out_size >= 4) {
         uint32_t val = *(uint32_t *)out_buf;
         if(val > 0 && device->override_template_count) {
@@ -306,9 +306,8 @@ bool tudor_enroll_start(struct tudor_device *device, RECGUID guid, enum tudor_fi
         return false;
     }
 
-    //Don't erase sensor templates - old templates with persisted identity data
-    //are needed for the DLL's background thread to call DB_INIT (0xA5 01),
-    //which loads biometric templates into the matching engine.
+    //Don't erase sensor templates - they are the enrolled fingerprints (a wildcard
+    //DeleteRecord makes the DLL send 0xA5 01, which formats the whole sensor DB).
     //The template count override in tudor_devctrl handles DATABASE_FULL.
 
     //Follow https://docs.microsoft.com/en-us/windows/win32/secbiomet/adapter-workflow - WinBioEnrollBegin

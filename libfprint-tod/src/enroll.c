@@ -70,6 +70,14 @@ static void enroll_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_da
                 break;
             }
 
+            //Check if the sensor rejected the finger as already enrolled
+            if(msg->resp_enroll.duplicate) {
+                g_info("Tudor host reported duplicate enrollment for GUID %08x... finger %d", params->guid.PartA, params->finger);
+                fpi_device_enroll_complete(FP_DEVICE(tdev), NULL, fpi_device_error_new(FP_DEVICE_ERROR_DATA_DUPLICATE));
+                free_enroll_params(params);
+                break;
+            }
+
             //Complete the enrollment
             //Get the print to enroll
             FpPrint *print;

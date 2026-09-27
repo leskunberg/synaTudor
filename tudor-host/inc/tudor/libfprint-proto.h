@@ -98,7 +98,7 @@ struct ipc_msg_enroll {
 struct ipc_msg_resp_enroll {
     enum ipc_msg_type type;
 
-    bool retry, done;
+    bool retry, done, duplicate;
     uint8_t record_data[];
 };
 

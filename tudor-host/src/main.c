@@ -174,7 +174,7 @@ int main() {
 
     //Open device using the hidraw command channel fd
     struct tudor_device dev;
-    struct tudor_device_state state;
+    struct tudor_device_state state = {0}; //Read back by the DLL through the registry shim
     if(!tudor_open(&dev, cmd_fd, &state)) {
         log_error("Couldn't open tudor device!");
         return EXIT_FAILURE;

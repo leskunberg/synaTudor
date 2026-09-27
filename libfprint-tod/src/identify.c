@@ -53,11 +53,13 @@ static void identify_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_
                 break;
             }
 
-            //Check if we should retry
+            //Check if we should retry - libfprint only accepts one report per action,
+            //so end this one and let fprintd restart the identify
             if(msg->resp_identify.retry) {
                 g_info("Tudor host requested identify capture retry");
                 fpi_device_identify_report(FP_DEVICE(tdev), NULL, NULL, fpi_device_retry_new(FP_DEVICE_RETRY_GENERAL));
-                recv_ipc_msg_no_timeout(tdev, identify_recv_cb, user_data);
+                fpi_device_identify_complete(FP_DEVICE(tdev), NULL);
+                free_identify_params(params);
                 break;
             }
 

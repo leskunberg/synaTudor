@@ -4,6 +4,9 @@
 
 char probe_sensor_name[IPC_SENSOR_NAME_SIZE+1] = {0};
 
+//Consecutive capture errors (not bad captures) tolerated before giving up
+#define MAX_CONSECUTIVE_CAPTURE_FAILS 3
+
 struct handler_state {
     struct tudor_device *dev;
     pthread_mutex_t lock;
@@ -11,6 +14,7 @@ struct handler_state {
 
     tudor_async_res_t async_res;
     bool async_cancelled;
+    int capture_fails;
 
     union {
         struct {
@@ -87,10 +91,26 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
         //Commit the enrollment
         bool is_dupl;
         if(!tudor_enroll_commit(state->dev, &is_dupl)) {
-            log_error("Couldn't commit enrollment!");
-            abort();
+            if(!is_dupl) {
+                log_error("Couldn't commit enrollment!");
+                abort();
+            }
+
+            //The sensor already holds a template of this finger - report it instead of dying
+            log_warn("Enrollment duplicates an existing template -> discarding");
+            tudor_enroll_discard(state->dev);
+
+            struct ipc_msg_resp_enroll msg = {
+                .type = IPC_MSG_RESP_ENROLL,
+                .retry = false,
+                .done = true,
+                .duplicate = true
+            };
+            ipc_send_msg(state->ipc_sock, &msg, sizeof(msg));
+
+            cant_fail_ret(pthread_mutex_unlock(&state->lock));
+            return;
         }
-        if(is_dupl) log_warn("Overwritting duplicate enrollment...");
 
         //Find the resulting record in the in-memory list
         cant_fail_ret(pthread_mutex_lock(&state->dev->records_lock));
@@ -182,32 +202,27 @@ static void verify_via_identify_cb(tudor_async_res_t *res, bool success, struct 
         return;
     }
 
-    //Check success - retry on bad capture
-    if(!success && state->action.identify.retry) {
-        init_action(state);
-        if(!tudor_identify(state->dev, &state->action.identify.retry, &state->action.identify.has_match, &state->action.identify.guid, &state->action.identify.finger, &state->async_res)) {
-            log_error("Couldn't start verify (via identify) retry!");
+    //Report failed captures as retries - libfprint ends the action and fprintd starts a
+    //new verify. Besides bad captures, this covers capture errors like WINBIO_E_CAPTURE_ABORTED,
+    //caused by a stale scan that a cancelled capture left armed on the sensor.
+    if(!success) {
+        if(!state->action.identify.retry && ++state->capture_fails > MAX_CONSECUTIVE_CAPTURE_FAILS) {
+            log_error("Verify (via identify) action failed %d times in a row!", state->capture_fails);
             abort();
         }
 
-        //Send retry response
         struct ipc_msg_resp_verify msg = {
             .type = IPC_MSG_RESP_VERIFY,
             .retry = true,
             .did_match = false
         };
         ipc_send_msg(state->ipc_sock, &msg, sizeof(msg));
-        log_info("Verify (via identify) capture error -> retrying...");
+        log_info("Verify (via identify) capture error -> requesting retry");
 
         cant_fail_ret(pthread_mutex_unlock(&state->lock));
-        tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) verify_via_identify_cb, state);
         return;
     }
-
-    if(!success) {
-        log_error("Verify (via identify) action failed!");
-        abort();
-    }
+    state->capture_fails = 0;
 
     //Send response
     struct ipc_msg_resp_verify msg = {
@@ -234,11 +249,25 @@ static void identify_cb(tudor_async_res_t *res, bool success, struct handler_sta
         return;
     }
 
-    //Check success
+    //Report failed captures as retries (see verify_via_identify_cb)
     if(!success) {
-        log_error("Identify action failed!");
-        abort();
+        if(!state->action.identify.retry && ++state->capture_fails > MAX_CONSECUTIVE_CAPTURE_FAILS) {
+            log_error("Identify action failed %d times in a row!", state->capture_fails);
+            abort();
+        }
+
+        struct ipc_msg_resp_identify retry_msg = {
+            .type = IPC_MSG_RESP_IDENTIFY,
+            .retry = true,
+            .did_match = false
+        };
+        ipc_send_msg(state->ipc_sock, &retry_msg, sizeof(retry_msg));
+        log_info("Identify capture error -> requesting retry");
+
+        cant_fail_ret(pthread_mutex_unlock(&state->lock));
+        return;
     }
+    state->capture_fails = 0;
 
     //Send response
     struct ipc_msg_resp_identify msg = {
@@ -299,7 +328,12 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
             size_t rec_size = ipc_recv_msg(state->ipc_sock, msg, type, sizeof(struct ipc_msg_add_record), sizeof(struct ipc_msg_add_record) + IPC_MAX_RECORD_SIZE, NULL, NULL) - sizeof(struct ipc_msg_add_record);
 
             //Add the record
-            if(!tudor_add_record(state->dev, msg->guid, msg->finger, msg->record_data, rec_size)) {
+            bool added = tudor_add_record(state->dev, msg->guid, msg->finger, msg->record_data, rec_size);
+            if(!added && state->dev->use_dll_storage) {
+                //The template lives on the sensor and this list is only bookkeeping - wiping
+                //here would delete the enrolled template while leaving the list entry behind
+                log_info("Record GUID %08x... finger %d is already known", msg->guid.PartA, msg->finger);
+            } else if(!added) {
                 //Delete the old one first
                 log_warn("Replacing old record GUID %08x... finger %d", msg->guid.PartA, msg->finger);
                 tudor_wipe_records(state->dev, &msg->guid, msg->finger);

@@ -30,8 +30,8 @@ extern int win_hidraw_fd;       // command channel (reports 0x0E/0x0F/0x10/0x11)
 extern int win_hidraw_fd_img;   // image channel (reports 0x0C/0x0D/0x20/0x21), -1 if unavailable
 
 //When true, events (report 0x10) are passed through to the DLL.
-//Set after "wait event", cleared after "end event".
-extern bool win_hid_pass_heartbeats;
+//Set before "wait event" is sent, cleared after "end event".
+extern volatile bool win_hid_pass_heartbeats;
 
 //Set to true during shutdown to signal background threads to exit
 extern volatile bool tudor_shutting_down;

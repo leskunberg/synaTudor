@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <linux/hidraw.h>
 #include "internal.h"
 
@@ -327,23 +328,45 @@ static bool ssi_feature_0c(int fd, uint8_t subcmd, uint16_t param, const char *l
     return true;
 }
 
+/*
+ * Over Bluetooth, the image channel reports live on the same hidraw node as the
+ * command channel (and the keyboard itself). Feature 0x0C is only 20 bytes long
+ * there, so every 64 byte SSI request fails with EIO - captures work without the
+ * cycle on that transport.
+ */
+static bool img_channel_shares_cmd_device(int img_fd) {
+    static int shared = -1;
+    if(shared < 0) {
+        struct stat cmd_st, img_st;
+        shared = fstat(win_hidraw_fd, &cmd_st) == 0 && fstat(img_fd, &img_st) == 0 && cmd_st.st_rdev == img_st.st_rdev;
+        if(shared) log_info("hid: image channel shares the command channel device (Bluetooth) - skipping SSI scan cycle and image monitor");
+    }
+    return shared;
+}
+
 static void ssi_run_scan_cycle(int fd) {
     if(fd < 0) {
         log_warn("ssi_run_scan_cycle: no image channel fd available — sensor capture may fail!");
         return;
     }
+    if(img_channel_shares_cmd_device(fd)) return;
     log_info("ssi_run_scan_cycle: starting on fd=%d", fd);
 
-    ssi_feature_0c(fd, 0x04, 0x0000, "INIT");
-    ssi_feature_0c(fd, 0x0F, 0x804A, "READ_REG(0x804A)");
-    ssi_feature_0c(fd, 0x03, 0x0000, "CONFIGURE");
-    ssi_feature_0c(fd, 0x0F, 0xFF58, "READ_REG(0xFF58)");
-    ssi_feature_0c(fd, 0x0F, 0x325E, "READ_REG(0x325E)");
-    ssi_feature_0c(fd, 0x0F, 0x1C3C, "READ_REG(0x1C3C)");
-    ssi_feature_0c(fd, 0x0F, 0x323D, "READ_REG(0x323D)");
-    ssi_feature_0c(fd, 0x80, 0x0000, "START_SCAN");
+    //Stop at the first failure instead of sending the rest of the cycle
+    bool ok = ssi_feature_0c(fd, 0x04, 0x0000, "INIT") &&
+        ssi_feature_0c(fd, 0x0F, 0x804A, "READ_REG(0x804A)") &&
+        ssi_feature_0c(fd, 0x03, 0x0000, "CONFIGURE") &&
+        ssi_feature_0c(fd, 0x0F, 0xFF58, "READ_REG(0xFF58)") &&
+        ssi_feature_0c(fd, 0x0F, 0x325E, "READ_REG(0x325E)") &&
+        ssi_feature_0c(fd, 0x0F, 0x1C3C, "READ_REG(0x1C3C)") &&
+        ssi_feature_0c(fd, 0x0F, 0x323D, "READ_REG(0x323D)") &&
+        ssi_feature_0c(fd, 0x80, 0x0000, "START_SCAN");
 
-    log_info("ssi_run_scan_cycle: complete — sensor image pipeline active");
+    if(ok) {
+        log_info("ssi_run_scan_cycle: complete — sensor image pipeline active");
+    } else {
+        log_warn("ssi_run_scan_cycle: aborted, sensor image pipeline not started");
+    }
 }
 
 __winfnc BOOLEAN HidD_GetFeature(HANDLE device, void *report_buf, ULONG report_len) {
@@ -385,9 +408,16 @@ __winfnc BOOLEAN HidD_SetFeature(HANDLE device, void *report_buf, ULONG report_l
         log_warn("HidD_SetFeature: no hidraw fd available");
         return FALSE;
     }
+
+    //Enable event pass-through before 'wait event' goes out - the sensor may answer while
+    //the ioctl is still in flight, and the reader would drop that event otherwise
+    bool is_wait_event = (fd == win_hidraw_fd && report_len >= 5 && rb[1] == 'w' && rb[2] == 'a' && rb[3] == 'i' && rb[4] == 't');
+    if(is_wait_event) win_hid_pass_heartbeats = true;
+
     int ret = ioctl(fd, HIDIOCSFEATURE(report_len), report_buf);
     if(ret < 0) {
         log_warn("HidD_SetFeature: ioctl failed: %s", strerror(errno));
+        if(is_wait_event) win_hid_pass_heartbeats = false;
         return FALSE;
     }
     log_debug("HidD_SetFeature: sent %d bytes", ret);
@@ -402,12 +432,12 @@ __winfnc BOOLEAN HidD_SetFeature(HANDLE device, void *report_buf, ULONG report_l
      * Feature reports bidirectionally and doesn't produce stale input reports.
      */
     if(fd == win_hidraw_fd) {
-        bool is_wait_event = (report_len >= 5 && rb[1] == 'w' && rb[2] == 'a' && rb[3] == 'i' && rb[4] == 't');
         if(is_wait_event) {
-            log_info("HidD_SetFeature: 'wait event' detected — enabling heartbeat pass-through");
-            win_hid_pass_heartbeats = true;
+            log_info("HidD_SetFeature: 'wait event' detected — enabled heartbeat pass-through");
             ssi_run_scan_cycle(win_hidraw_fd_img);
-            start_img_monitor(win_hidraw_fd_img);
+            //On a shared device the monitor would only duplicate (and log) keyboard traffic
+            if(win_hidraw_fd_img >= 0 && !img_channel_shares_cmd_device(win_hidraw_fd_img))
+                start_img_monitor(win_hidraw_fd_img);
             /* No drain — let all events reach hid_read_thread and the DLL.
              * The sensor sends alternating heartbeats that are indistinguishable
              * from real events. "end event" stops them between cycles, and
